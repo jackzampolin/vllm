@@ -1576,7 +1576,14 @@ def sparse_attn_indexer(
     qs_world_size = 1
     qs_rank = 0
     if envs.VLLM_DCP_QUERY_SPLIT:
-        _qs = get_query_split_group()
+        from vllm.distributed import parallel_state
+
+        selector = getattr(parallel_state, "get_indexer_query_split_group", None)
+        _qs = (
+            selector(dcp_world_size)
+            if selector is not None
+            else get_query_split_group()
+        )
         if int(_qs.world_size) > 1:
             qs_group = _qs
             qs_world_size = int(_qs.world_size)

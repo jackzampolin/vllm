@@ -758,9 +758,7 @@ class GroupCoordinator:
     ) -> torch.Tensor:
         """Reduce-scatter and preserve a physically head-major output view."""
         if self.world_size <= 1 or dim != 1:
-            raise RuntimeError(
-                "reduce_scatter_head_major requires DCP heads on dim 1"
-            )
+            raise RuntimeError("reduce_scatter_head_major requires DCP heads on dim 1")
         if self.device_communicator is None:
             raise RuntimeError(
                 "reduce_scatter_head_major requires a device communicator"
@@ -1447,41 +1445,6 @@ def get_query_split_group() -> GroupCoordinator:
     return _QUERY_SPLIT
 
 
-def _get_query_split_group_ranks(
-    tp_group_ranks: list[list[int]], dcp_size: int
-) -> list[list[int]]:
-    """Transpose DCP groups within each independent TP cohort.
-
-    Args:
-        tp_group_ranks: Independent TP cohorts expressed as global ranks.
-        dcp_size: Number of consecutive ranks in each DCP group.
-
-    Returns:
-        Groups joining the same DCP-rank position across each TP cohort.
-
-    Raises:
-        ValueError: If ``dcp_size`` is nonpositive or does not divide a TP
-            cohort.
-    """
-    if dcp_size <= 0:
-        raise ValueError(f"dcp_size must be positive, got {dcp_size}")
-
-    query_split_ranks: list[list[int]] = []
-    for tp_ranks in tp_group_ranks:
-        if len(tp_ranks) % dcp_size != 0:
-            raise ValueError(
-                f"TP group size {len(tp_ranks)} must be divisible by "
-                f"dcp_size {dcp_size}"
-            )
-        dcp_groups = [
-            tp_ranks[start : start + dcp_size]
-            for start in range(0, len(tp_ranks), dcp_size)
-        ]
-        for dcp_rank in range(dcp_size):
-            query_split_ranks.append([group[dcp_rank] for group in dcp_groups])
-    return query_split_ranks
-
-
 _DCP_CKV_PREFETCH: GroupCoordinator | None = None
 
 
@@ -1888,6 +1851,41 @@ def init_distributed_environment(
             )
         else:
             _INNER_DP_WORLD = _WORLD
+
+
+def _get_query_split_group_ranks(
+    tp_group_ranks: list[list[int]], dcp_size: int
+) -> list[list[int]]:
+    """Transpose DCP groups within each independent TP cohort.
+
+    Args:
+        tp_group_ranks: Independent TP cohorts expressed as global ranks.
+        dcp_size: Number of consecutive ranks in each DCP group.
+
+    Returns:
+        Groups joining the same DCP-rank position across each TP cohort.
+
+    Raises:
+        ValueError: If ``dcp_size`` is nonpositive or does not divide a TP
+            cohort.
+    """
+    if dcp_size <= 0:
+        raise ValueError(f"dcp_size must be positive, got {dcp_size}")
+
+    query_split_ranks: list[list[int]] = []
+    for tp_ranks in tp_group_ranks:
+        if len(tp_ranks) % dcp_size != 0:
+            raise ValueError(
+                f"TP group size {len(tp_ranks)} must be divisible by "
+                f"dcp_size {dcp_size}"
+            )
+        dcp_groups = [
+            tp_ranks[start : start + dcp_size]
+            for start in range(0, len(tp_ranks), dcp_size)
+        ]
+        for dcp_rank in range(dcp_size):
+            query_split_ranks.append([group[dcp_rank] for group in dcp_groups])
+    return query_split_ranks
 
 
 def initialize_model_parallel(
