@@ -1250,6 +1250,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         if self.quant_config.rank_sliced_metadata is None:
             self._shard_tensors_for_tensor_parallel(layer)
         device = layer.w13_trellis.device
+        # w13_weight/w2_weight are zero-storage meta shape descriptors. The
+        # generic LoRA wrapper must allocate adapter buffers beside the
+        # physical EXL3 slabs, not on the descriptor device.
+        layer.lora_device = device
         for prefix in ("w13", "w2"):
             for attr in ("suh", "svh", "trellis", "mcg", "mul1"):
                 param = getattr(layer, f"{prefix}_{attr}")

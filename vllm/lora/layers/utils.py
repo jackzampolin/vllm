@@ -48,6 +48,13 @@ def _get_lora_device(base_layer: nn.Module) -> torch.device:
     if hasattr(base_layer, "routed_experts"):
         base_layer = base_layer.routed_experts
 
+    # Quantization backends may expose zero-storage meta tensors solely as
+    # logical weight-shape descriptors. Allow them to name the device that
+    # owns their physical weights instead of materializing LoRA buffers on
+    # the descriptor device.
+    if hasattr(base_layer, "lora_device"):
+        return torch.device(base_layer.lora_device)
+
     # unquantizedLinear
     if hasattr(base_layer, "weight"):
         return base_layer.weight.device
