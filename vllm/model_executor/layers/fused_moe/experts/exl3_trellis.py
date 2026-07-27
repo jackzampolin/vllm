@@ -5,12 +5,14 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -60,11 +62,26 @@ class Exl3TrellisLoRAExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         self.intermediate_size = moe_config.intermediate_size_per_partition
         self.hidden_size = moe_config.hidden_dim
         self.topk = moe_config.experts_per_token
+        self.use_eager_oracle = os.environ.get("VLLM_EXL3_LORA_ORACLE", "0") == "1"
+        vllm_config = get_current_vllm_config_or_none()
+        experimental_graphs = (
+            os.environ.get("VLLM_EXL3_LORA_EXPERIMENTAL_GRAPHS", "0") == "1"
+        )
+        if (
+            vllm_config is not None
+            and not vllm_config.model_config.enforce_eager
+            and not experimental_graphs
+        ):
+            raise ValueError(
+                "Dynamic EXL3 routed LoRA currently requires --enforce-eager. "
+                "CUDA graph adapter switching remains experimental; set "
+                "VLLM_EXL3_LORA_EXPERIMENTAL_GRAPHS=1 only for validation."
+            )
 
     def should_use_no_lora_fast_path(self) -> bool:
         """Return whether this forward contains no adapter-backed tokens."""
         context = self._lora_context
-        return context is not None and context.punica_wrapper.no_lora
+        return context is None or context.punica_wrapper.no_lora
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -161,6 +178,103 @@ class Exl3TrellisLoRAExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ) -> None:
+        if self.use_eager_oracle:
+            self._apply_eager_oracle(
+                output=output,
+                hidden_states=hidden_states,
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=activation,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                a1q_scale=a1q_scale,
+                a2_scale=a2_scale,
+                workspace13=workspace13,
+                workspace2=workspace2,
+                expert_tokens_meta=expert_tokens_meta,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
+            return
+        del global_num_experts, a1q_scale, a2_scale, workspace13, workspace2
+        del expert_tokens_meta
+        if activation != MoEActivation.SILU:
+            raise NotImplementedError(f"EXL3 LoRA supports SiLU only, got {activation}")
+        if expert_map is not None:
+            raise NotImplementedError("EXL3 LoRA does not support expert maps")
+        if apply_router_weight_on_input:
+            raise NotImplementedError(
+                "EXL3 LoRA does not apply router weights on the input"
+            )
+        lora_context = self._lora_context
+        if lora_context is None:
+            raise RuntimeError("EXL3 LoRA context was not initialized")
+
+        binding = self.quant_method.bind_rank_sliced_lora(
+            self.layer,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            output=output,
+        )
+        fc1 = binding.run_fc1_base()
+        (
+            sorted_token_ids_lora,
+            expert_ids_lora,
+            num_tokens_post_padded_lora,
+            token_lora_mapping,
+        ) = self.apply_w13_lora(
+            lora_context,
+            y=fc1,
+            x=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            expert_map=None,
+            w1=w1,
+            w2=w2,
+            num_tokens=hidden_states.size(0),
+            top_k_num=topk_ids.size(1),
+        )
+        activated = binding.run_activation()
+        route_output = binding.run_fc2_base()
+        self.apply_w2_lora(
+            lora_context,
+            y=route_output,
+            x=activated,
+            topk_weights=topk_weights,
+            sorted_token_ids_lora=sorted_token_ids_lora,
+            expert_ids_lora=expert_ids_lora,
+            num_tokens_post_padded_lora=num_tokens_post_padded_lora,
+            token_lora_mapping=token_lora_mapping,
+            num_tokens=hidden_states.size(0),
+            w1=w1,
+            w2=w2,
+            top_k_num=topk_ids.size(1),
+        )
+        reduced = binding.run_reduce()
+        if reduced.data_ptr() != output.data_ptr():
+            output.copy_(reduced)
+
+    def _apply_eager_oracle(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        apply_router_weight_on_input: bool,
+    ) -> None:
+        """Run the projection-level numerical oracle for diagnosis."""
         del global_num_experts, a1q_scale, a2_scale, expert_tokens_meta
         if activation != MoEActivation.SILU:
             raise NotImplementedError(f"EXL3 LoRA supports SiLU only, got {activation}")

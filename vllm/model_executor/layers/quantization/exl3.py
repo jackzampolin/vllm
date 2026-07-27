@@ -1886,6 +1886,97 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             )
         return out32.to(x.dtype)
 
+    def bind_rank_sliced_lora(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        *,
+        output: torch.Tensor,
+    ):
+        """Bind the planned split Trellis pipeline for an active adapter."""
+        if (
+            torch.cuda.is_current_stream_capturing()
+            and os.environ.get("VLLM_EXL3_LORA_EXPERIMENTAL_GRAPHS", "0") != "1"
+        ):
+            raise RuntimeError(
+                "Dynamic EXL3 LoRA CUDA graph capture is disabled until adapter "
+                "switching parity passes; launch with --enforce-eager."
+            )
+        runtime = self._rank_sliced_runtime(layer, x, topk_ids)
+        if "lora_trellis_plan" not in runtime:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "EXL3 LoRA split plans must be created by adapter warmup "
+                    "before CUDA graph capture"
+                )
+            api = runtime["api"]
+
+            def _plan_lora(base_plan):
+                if base_plan is None:
+                    return None, None
+                plan = api.plan_lora(base_plan.caps)
+                scratch_spec = plan.scratch_specs()[0]
+                scratch = torch.empty(
+                    scratch_spec.shape,
+                    dtype=scratch_spec.dtype,
+                    device=scratch_spec.device,
+                )
+                return plan, scratch
+
+            lora_plan, lora_scratch = _plan_lora(runtime["trellis_plan"])
+            prefill_plan, prefill_scratch = _plan_lora(runtime["prefill_plan"])
+            runtime["lora_trellis_plan"] = lora_plan
+            runtime["lora_trellis_scratch"] = lora_scratch
+            runtime["lora_prefill_plan"] = prefill_plan
+            runtime["lora_prefill_scratch"] = prefill_scratch
+            scratch_mib = (
+                lora_scratch.numel() * lora_scratch.element_size()
+                + (
+                    0
+                    if prefill_scratch is None
+                    else prefill_scratch.numel() * prefill_scratch.element_size()
+                )
+            ) / (1 << 20)
+            logger.info_once(
+                "EXL3 LoRA split runtime planned: decode capacity=%d, "
+                "prefill capacity=%s, scratch=%.1f MiB",
+                int(runtime["max_trellis_m"]),
+                (
+                    "disabled"
+                    if prefill_plan is None
+                    else str(runtime["max_batched_tokens"])
+                ),
+                scratch_mib,
+            )
+
+        m = int(x.shape[0])
+        if m <= runtime["max_trellis_m"]:
+            plan = runtime["lora_trellis_plan"]
+            scratch = runtime["lora_trellis_scratch"]
+        else:
+            if m > runtime["max_batched_tokens"]:
+                raise ValueError(
+                    "EXL3 LoRA batch exceeds its planned capacity: "
+                    f"m={m}, capacity={runtime['max_batched_tokens']}"
+                )
+            plan = runtime["lora_prefill_plan"]
+            scratch = runtime["lora_prefill_scratch"]
+            if plan is None:
+                raise RuntimeError(
+                    "EXL3 LoRA prefill needs VLLM_EXL3_PREFILL_TRELLIS=1"
+                )
+        return runtime["api"].bind_lora(
+            plan,
+            scratch=scratch,
+            a=x,
+            weights=layer.exl3_trellis_weights,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            output=output,
+        )
+
     def apply(
         self,
         layer: RoutedExperts,

@@ -69,6 +69,7 @@ def test_exl3_lora_oracle_preserves_projection_order() -> None:
     experts.hidden_size = hidden_size
     experts.topk = topk
     experts._lora_context = SimpleNamespace()
+    experts.use_eager_oracle = True
 
     def apply_w13_lora(
         self,
@@ -218,6 +219,105 @@ def test_exl3_no_lora_uses_original_quant_method() -> None:
         None,
         None,
     )
+
+
+def test_exl3_missing_lora_context_uses_base_path() -> None:
+    experts = object.__new__(Exl3TrellisLoRAExperts)
+    experts._lora_context = None
+    assert experts.should_use_no_lora_fast_path()
+
+
+def test_exl3_planned_split_injects_lora_between_base_stages() -> None:
+    events: list[str] = []
+    hidden_states = torch.tensor([[1.0, 2.0]])
+    topk_ids = torch.tensor([[0]])
+    topk_weights = torch.tensor([[1.0]])
+    output = torch.empty_like(hidden_states)
+    fc1 = torch.zeros((1, 1, 4))
+    activation = torch.full((1, 2), 3.0)
+    route_output = torch.zeros((1, 1, 2))
+
+    class Binding:
+        @staticmethod
+        def run_fc1_base():
+            events.append("fc1_base")
+            return fc1
+
+        @staticmethod
+        def run_activation():
+            assert torch.equal(fc1, torch.ones_like(fc1))
+            events.append("activation")
+            return activation
+
+        @staticmethod
+        def run_fc2_base():
+            events.append("fc2_base")
+            return route_output
+
+        @staticmethod
+        def run_reduce():
+            assert torch.equal(route_output, torch.full_like(route_output, 2.0))
+            events.append("reduce")
+            output.copy_(route_output.sum(dim=1))
+            return output
+
+    class QuantMethod:
+        @staticmethod
+        def bind_rank_sliced_lora(*args, **kwargs):
+            del args, kwargs
+            events.append("bind")
+            return Binding()
+
+    experts = object.__new__(Exl3TrellisLoRAExperts)
+    experts.quant_method = QuantMethod()
+    experts.layer = object()
+    experts.use_eager_oracle = False
+    experts._lora_context = SimpleNamespace()
+
+    def apply_w13_lora(self, context, *, y, **kwargs):
+        del self, context, kwargs
+        events.append("fc1_lora")
+        y.add_(1)
+        return "sorted", "experts", "count", "mapping"
+
+    def apply_w2_lora(self, context, *, y, x, **kwargs):
+        del self, context, kwargs
+        assert x is activation
+        events.append("fc2_lora")
+        y.add_(2)
+
+    experts.apply_w13_lora = MethodType(apply_w13_lora, experts)
+    experts.apply_w2_lora = MethodType(apply_w2_lora, experts)
+    logical_w13 = torch.empty((1, 4, 2), device="meta")
+    logical_w2 = torch.empty((1, 2, 2), device="meta")
+    experts.apply(
+        output=output,
+        hidden_states=hidden_states,
+        w1=logical_w13,
+        w2=logical_w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        activation=MoEActivation.SILU,
+        global_num_experts=1,
+        expert_map=None,
+        a1q_scale=None,
+        a2_scale=None,
+        workspace13=torch.empty(1),
+        workspace2=torch.empty(1),
+        expert_tokens_meta=None,
+        apply_router_weight_on_input=False,
+    )
+
+    assert events == [
+        "bind",
+        "fc1_base",
+        "fc1_lora",
+        "activation",
+        "fc2_base",
+        "fc2_lora",
+        "reduce",
+    ]
+    torch.testing.assert_close(output, torch.full_like(output, 2.0))
 
 
 def test_macaron_l2_inventory_is_exact_and_fail_closed() -> None:
