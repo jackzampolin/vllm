@@ -1,0 +1,39 @@
+{
+  "config": {
+    "alpha": 32,
+    "bias": "none",
+    "dropout": 0.0,
+    "rank": 16,
+    "targets": [
+      "down_proj",
+      "gate_proj",
+      "kv_a_proj_with_mqa",
+      "kv_b_proj",
+      "o_proj",
+      "q_a_proj",
+      "q_b_proj",
+      "up_proj"
+    ]
+  },
+  "dtype_counts": {
+    "BF16": 116448
+  },
+  "experts_per_layer": 256,
+  "file_size": 15393360208,
+  "header_size": 17275208,
+  "layers": [
+    0,
+    77
+  ],
+  "mtp_layer_78_present": false,
+  "payload_bytes": 15376084992,
+  "repo_id": "mindlab-research/Macaron-V1-Venti",
+  "requested_revision": "3d6f30eea38663a7b9320f3a6b28822ed4aa7ac4",
+  "resolved_revision": "3d6f30eea38663a7b9320f3a6b28822ed4aa7ac4",
+  "routed_expert_layers": [
+    3,
+    77
+  ],
+  "subfolder": "loras/L2",
+  "tensor_count": 116448
+}

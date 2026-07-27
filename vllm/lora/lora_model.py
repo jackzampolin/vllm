@@ -128,6 +128,7 @@ class LoRAModel:
         """Create a LoRAModel from a dictionary of tensors."""
         pin_memory = str(device) == "cpu" and PIN_MEMORY
         loras: dict[str, LoRALayerWeights] = {}
+        consumed_factors: dict[tuple[str, bool], str] = {}
         for tensor_name, tensor in tensors.items():
             if is_base_embedding_weights(tensor_name):
                 continue
@@ -137,6 +138,15 @@ class LoRAModel:
             module_name, is_lora_a = parse_fine_tuned_lora_name(
                 tensor_name, weights_mapper
             )
+            factor_key = (module_name, is_lora_a)
+            previous = consumed_factors.get(factor_key)
+            if previous is not None:
+                factor = "A" if is_lora_a else "B"
+                raise ValueError(
+                    f"LoRA tensors {previous!r} and {tensor_name!r} both map "
+                    f"to {module_name!r} factor {factor}; refusing to overwrite"
+                )
+            consumed_factors[factor_key] = tensor_name
             if module_name not in loras:
                 loras[module_name] = LoRALayerWeights.from_config(
                     module_name, peft_helper
@@ -161,6 +171,17 @@ class LoRAModel:
                 if pin_memory:
                     loras[module_name].lora_b = loras[module_name].lora_b.pin_memory()
 
+        incomplete = sorted(
+            module_name
+            for module_name, lora in loras.items()
+            if lora.lora_a is None or lora.lora_b is None
+        )
+        if incomplete:
+            raise ValueError(
+                "LoRA modules must provide exactly one A tensor and one B tensor; "
+                f"incomplete modules: {incomplete[:32]!r}"
+                + (" ..." if len(incomplete) > 32 else "")
+            )
         return cls(lora_model_id, peft_helper.r, loras)
 
     @classmethod

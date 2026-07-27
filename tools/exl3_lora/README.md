@@ -1,4 +1,26 @@
-# GLM-5.2 EXL3 v31 source baseline
+# GLM-5.2 EXL3 v31 development baseline
+
+`inspect_adapter.py` audits the pinned Macaron L2 adapter before its 14.34 GiB
+tensor payload is downloaded. It fetches only `adapter_config.json` and the
+17 MiB safetensors header, then fails closed on:
+
+- revision, file-size, rank, alpha, dropout, bias, or target drift;
+- missing or unknown tensors;
+- layer, expert, projection, factor, shape, or dtype drift;
+- overlapping, gapped, truncated, or trailing tensor data ranges;
+- accidental adapter coverage of the separate MTP layer 78.
+
+Run it from the repository virtual environment:
+
+```bash
+.venv/bin/python tools/exl3_lora/inspect_adapter.py \
+  --output tools/exl3_lora/macaron-l2-inventory.json
+```
+
+Authentication comes from the normal Hugging Face token cache. Do not pass a
+token on the command line.
+
+## Source identity
 
 This branch starts from the exact vLLM source installed in the published
 GLM-5.2 EXL3 v31 runtime.

@@ -40,6 +40,13 @@ from vllm.model_executor.layers.fused_moe import (
     MoEActivation,
     RoutedExperts,
 )
+from vllm.model_executor.layers.fused_moe.config import (
+    FUSED_MOE_UNQUANTIZED_CONFIG,
+)
+from vllm.model_executor.layers.fused_moe.modular_kernel import (
+    FusedMoEExpertsModular,
+    FusedMoEPrepareAndFinalizeModular,
+)
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -1137,7 +1144,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        del params_dtype, extra_weight_attrs
+        del extra_weight_attrs
         if self.moe.moe_parallel_config.use_ep:
             raise NotImplementedError(
                 "EXL3 correctness MoE currently supports TP but not expert parallelism"
@@ -1150,6 +1157,20 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer.exl3_tp_size = self.moe.moe_parallel_config.tp_size
         layer.exl3_hidden_size = hidden_size
         layer.exl3_intermediate_size_per_partition = intermediate_size_per_partition
+        # FusedMoEModularMethod uses the conventional logical weight shapes to
+        # size workspaces and configure Punica. EXL3 owns its physical tensors
+        # separately, so these zero-storage meta tensors are shape descriptors
+        # only and never participate in a GEMM or checkpoint load.
+        layer.w13_weight = torch.empty(
+            (num_experts, 2 * intermediate_size_per_partition, hidden_size),
+            dtype=params_dtype,
+            device="meta",
+        )
+        layer.w2_weight = torch.empty(
+            (num_experts, hidden_size, intermediate_size_per_partition),
+            dtype=params_dtype,
+            device="meta",
+        )
         rank_sliced = self.quant_config.rank_sliced_metadata is not None
         if rank_sliced:
             checkpoint_tp = int(self.quant_config.rank_sliced_metadata["tp"])
@@ -1173,9 +1194,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             # No silent fallback: a wrong capacity here puts the target and the
             # rank-sliced MTP draft on different plans with no error, which is
             # exactly the class of mismatch that corrupts only at scale.
-            if scheduler_config is None or getattr(
-                scheduler_config, "max_num_batched_tokens", None
-            ) is None:
+            if (
+                scheduler_config is None
+                or getattr(scheduler_config, "max_num_batched_tokens", None) is None
+            ):
                 raise ValueError(
                     "EXL3 rank-sliced MoE requires scheduler_config."
                     "max_num_batched_tokens to plan its Trellis arena; refusing to "
@@ -1470,7 +1492,31 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         self, layer: RoutedExperts
     ) -> FusedMoEQuantConfig | None:
         del layer
-        return None
+        # The physical experts remain EXL3-quantized. This descriptor tells the
+        # modular prepare/finalize layer to leave activations unquantized.
+        return FUSED_MOE_UNQUANTIZED_CONFIG
+
+    def select_gemm_impl(
+        self,
+        prepare_finalize: FusedMoEPrepareAndFinalizeModular,
+        layer: RoutedExperts,
+    ) -> FusedMoEExpertsModular:
+        del prepare_finalize
+        from vllm.model_executor.layers.fused_moe.experts.exl3_trellis import (
+            Exl3TrellisLoRAExperts,
+        )
+
+        if self.quant_config.rank_sliced_metadata is None:
+            raise NotImplementedError(
+                "EXL3 routed LoRA currently requires a rank-sliced checkpoint"
+            )
+        assert self.moe_quant_config is not None
+        return Exl3TrellisLoRAExperts(
+            self.moe,
+            self.moe_quant_config,
+            self,
+            layer,
+        )
 
     @property
     def topk_indices_dtype(self) -> torch.dtype | None:
@@ -1695,8 +1741,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             max_trellis_m,
             block_m,
             (
-                f"trellis block_m={prefill_block_m} "
-                f"arena={prefill_arena_mib:.1f}MiB"
+                f"trellis block_m={prefill_block_m} arena={prefill_arena_mib:.1f}MiB"
                 if prefill_plan is not None
                 else "parity"
             ),
