@@ -11,6 +11,7 @@ from tools.exl3_lora.inspect_adapter import (
     expected_l2_tensors,
     validate_safetensors_header,
 )
+from vllm.lora.layers.fused_moe import FusedMoEWithLoRA
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.utils import is_in_target_modules, parse_fine_tuned_lora_name
@@ -428,3 +429,43 @@ def test_lora_loader_rejects_incomplete_factor_pair() -> None:
             peft_helper=helper,
             device="meta",
         )
+
+
+def test_fused_moe_accepts_load_time_tp_slices() -> None:
+    wrapper = object.__new__(FusedMoEWithLoRA)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.tp_size = 4
+    wrapper.tp_rank = 2
+    wrapper.fully_sharded = True
+    wrapper.moe_config = SimpleNamespace(intermediate_size_per_partition=5)
+    wrapper.w13_lora_a_stacked = (torch.empty(1, 2, 4, 12),)
+    wrapper.w2_lora_b_stacked = (torch.empty(1, 2, 3, 16),)
+
+    w13_a = torch.arange(2 * 16 * 12).reshape(2, 16, 12)
+    w13_b = torch.arange(2 * 20 * 16).reshape(2, 20, 16)
+    w2_a = torch.arange(2 * 16 * 20).reshape(2, 16, 20)
+    w2_b = torch.arange(2 * 12 * 16).reshape(2, 12, 16)
+
+    expected = (
+        w13_a[:, 8:12],
+        w13_b[:, 10:15],
+        w2_a[:, :, 10:15],
+        w2_b[:, 6:9],
+    )
+    actual_from_full = (
+        wrapper._slice_w13_a(w13_a),
+        wrapper._slice_w13_b(w13_b),
+        wrapper._slice_w2_a(w2_a),
+        wrapper._slice_w2_b(w2_b),
+    )
+    actual_from_local = (
+        wrapper._slice_w13_a(expected[0]),
+        wrapper._slice_w13_b(expected[1]),
+        wrapper._slice_w2_a(expected[2]),
+        wrapper._slice_w2_b(expected[3]),
+    )
+    for full_result, local_result, expected_result in zip(
+        actual_from_full, actual_from_local, expected, strict=True
+    ):
+        torch.testing.assert_close(full_result, expected_result)
+        torch.testing.assert_close(local_result, expected_result)

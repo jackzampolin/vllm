@@ -18,7 +18,7 @@ from vllm.lora.layers import (
     LoRAMapping,
     LoRAMappingType,
 )
-from vllm.lora.lora_model import LoRAModel, MoEEPLoadSpec
+from vllm.lora.lora_model import LoRAModel, MoEEPLoadSpec, MoETPLoadSpec
 from vllm.lora.lora_weights import LoRALayerWeights, PackedLoRALayerWeights
 from vllm.lora.punica_wrapper import PunicaWrapperBase, get_punica_wrapper
 from vllm.lora.utils import (
@@ -148,6 +148,7 @@ class LoRAModelManager:
         self._create_lora_modules()
 
         self.moe_ep_load_spec: MoEEPLoadSpec | None = self._build_moe_ep_load_spec()
+        self.moe_tp_load_spec: MoETPLoadSpec | None = self._build_moe_tp_load_spec()
 
         self.model.lora_manager = self
 
@@ -1116,6 +1117,31 @@ class LoRAModelManager:
             local_num_experts=module.local_num_experts,
             global_num_experts=module.global_num_experts,
         )
+
+    def _build_moe_tp_load_spec(self) -> MoETPLoadSpec | None:
+        """Build load-time slicing metadata for fully-sharded 2D MoE LoRA."""
+        if (
+            not self._is_moe
+            or self._use_ep
+            or not self.lora_config.fully_sharded_loras
+        ):
+            return None
+        modules = [
+            module
+            for module in self.modules.values()
+            if isinstance(module, FusedMoEWithLoRA)
+            and not isinstance(module, FusedMoE3DWithLoRA)
+        ]
+        if not modules or modules[0].tp_size == 1:
+            return None
+        rank_sizes = {(module.tp_rank, module.tp_size) for module in modules}
+        if len(rank_sizes) != 1:
+            raise ValueError(
+                "FusedMoE LoRA modules disagree on tensor-parallel layout: "
+                f"{sorted(rank_sizes)!r}"
+            )
+        tp_rank, tp_size = next(iter(rank_sizes))
+        return MoETPLoadSpec(tp_rank=tp_rank, tp_size=tp_size)
 
     def _get_lora_layer_weights(
         self, lora_model: LoRAModel, module_name: str

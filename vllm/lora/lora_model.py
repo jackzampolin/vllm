@@ -35,6 +35,19 @@ class MoEEPLoadSpec:
     global_num_experts: int
 
 
+@dataclass(frozen=True)
+class MoETPLoadSpec:
+    """Tensor-parallel slicing metadata for 2D FusedMoE LoRA weights.
+
+    Fully-sharded MoE LoRA only consumes one TP-local quarter of every
+    per-expert factor. Slicing while the safetensors file is open prevents
+    every worker from retaining and packing the full checkpoint first.
+    """
+
+    tp_rank: int
+    tp_size: int
+
+
 _EXPERTS_SEPARATOR = ".experts."
 
 
@@ -55,6 +68,48 @@ def _is_remote_expert_key(raw_name: str, spec: "MoEEPLoadSpec") -> bool:
     expert_idx = int(idx_str)
     local_start = spec.ep_rank * spec.local_num_experts
     return not (local_start <= expert_idx < local_start + spec.local_num_experts)
+
+
+def _slice_tp_expert_tensor(
+    raw_name: str,
+    tensor: torch.Tensor,
+    spec: "MoETPLoadSpec",
+    weights_mapper: WeightsMapper | None = None,
+) -> torch.Tensor:
+    """Return the TP-local slice of one routed-expert LoRA factor."""
+    if spec.tp_size <= 0 or not 0 <= spec.tp_rank < spec.tp_size:
+        raise ValueError(
+            "Invalid MoE TP load spec: "
+            f"tp_rank={spec.tp_rank}, tp_size={spec.tp_size}"
+        )
+
+    module_name, is_lora_a = parse_fine_tuned_lora_name(raw_name, weights_mapper)
+    if _EXPERTS_SEPARATOR not in module_name:
+        return tensor
+
+    projection = module_name.rsplit(".", 1)[-1]
+    if projection in {"gate_proj", "up_proj"}:
+        shard_dim = 0
+    elif projection == "down_proj":
+        shard_dim = 1 if is_lora_a else 0
+    else:
+        return tensor
+
+    if tensor.ndim != 2:
+        raise ValueError(
+            f"Expected a 2D routed-expert LoRA tensor for {raw_name!r}, "
+            f"got shape {tuple(tensor.shape)}"
+        )
+    if tensor.shape[shard_dim] % spec.tp_size != 0:
+        raise ValueError(
+            f"Cannot TP{spec.tp_size}-slice {raw_name!r} shape "
+            f"{tuple(tensor.shape)} along dim {shard_dim}"
+        )
+
+    shard_size = tensor.shape[shard_dim] // spec.tp_size
+    return tensor.narrow(
+        shard_dim, spec.tp_rank * shard_size, shard_size
+    ).contiguous()
 
 
 class LoRAModel:
@@ -199,6 +254,7 @@ class LoRAModel:
         tensorizer_config_dict: dict | None = None,
         skip_prefixes: list[str] | None = None,
         moe_ep_spec: MoEEPLoadSpec | None = None,
+        moe_tp_spec: MoETPLoadSpec | None = None,
     ) -> "LoRAModel":
         """Create a LoRAModel from a local checkpoint.
 
@@ -219,6 +275,9 @@ class LoRAModel:
                 slicing metadata shared across all MoE layers. Non-local
                 expert weights are skipped at read time instead of being
                 loaded and discarded later.
+            moe_tp_spec: When fully-sharded 2D FusedMoE LoRA is present,
+                the (tp_rank, tp_size) metadata used to retain only the
+                rank-local slice of each routed-expert tensor.
 
         Returns:
             Loaded LoRA Model.
@@ -295,7 +354,12 @@ class LoRAModel:
                         module, moe_ep_spec
                     ):
                         continue
-                    tensors[module] = f.get_tensor(module)
+                    tensor = f.get_tensor(module)
+                    if moe_tp_spec is not None:
+                        tensor = _slice_tp_expert_tensor(
+                            module, tensor, moe_tp_spec, weights_mapper
+                        )
+                    tensors[module] = tensor
         elif os.path.isfile(lora_bin_file_path) or os.path.isfile(lora_pt_file_path):
             lora_file_path = (
                 lora_bin_file_path
@@ -312,6 +376,13 @@ class LoRAModel:
                     k: v
                     for k, v in tensors.items()
                     if not _is_remote_expert_key(k, moe_ep_spec)
+                }
+            if moe_tp_spec is not None:
+                tensors = {
+                    key: _slice_tp_expert_tensor(
+                        key, tensor, moe_tp_spec, weights_mapper
+                    )
+                    for key, tensor in tensors.items()
                 }
         else:
             raise ValueError(f"{lora_dir} doesn't contain tensors")

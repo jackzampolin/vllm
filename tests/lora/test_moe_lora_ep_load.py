@@ -6,9 +6,10 @@ load-time slicing
 """
 
 import pytest
+import safetensors.torch
 import torch
 
-from vllm.lora.lora_model import LoRAModel, MoEEPLoadSpec
+from vllm.lora.lora_model import LoRAModel, MoEEPLoadSpec, MoETPLoadSpec
 from vllm.lora.peft_helper import PEFTHelper
 
 NUM_LAYERS = 48
@@ -88,3 +89,82 @@ def test_moe_lora_ep2_real_qwen3moe(qwen3moe_lora_files, ep_rank):
             assert expert_start <= expert_idx < expert_end, (
                 f"non-local expert {expert_idx} leaked: {name}"
             )
+
+
+@pytest.mark.skip_global_cleanup
+def test_moe_lora_tp4_load_slices_routed_expert_factors(tmp_path, monkeypatch):
+    monkeypatch.setattr("vllm.lora.lora_model.PIN_MEMORY", False)
+    prefix = "base_model.model.model.layers.3.mlp"
+    tensors = {
+        f"{prefix}.experts.0.gate_proj.lora_A.weight": torch.arange(
+            16 * 12, dtype=torch.float32
+        ).reshape(16, 12),
+        f"{prefix}.experts.0.gate_proj.lora_B.weight": torch.arange(
+            20 * 16, dtype=torch.float32
+        ).reshape(20, 16),
+        f"{prefix}.experts.0.up_proj.lora_A.weight": torch.arange(
+            16 * 12, dtype=torch.float32
+        ).reshape(16, 12),
+        f"{prefix}.experts.0.up_proj.lora_B.weight": torch.arange(
+            20 * 16, dtype=torch.float32
+        ).reshape(20, 16),
+        f"{prefix}.experts.0.down_proj.lora_A.weight": torch.arange(
+            16 * 20, dtype=torch.float32
+        ).reshape(16, 20),
+        f"{prefix}.experts.0.down_proj.lora_B.weight": torch.arange(
+            12 * 16, dtype=torch.float32
+        ).reshape(12, 16),
+        f"{prefix}.shared_experts.gate_proj.lora_A.weight": torch.arange(
+            16 * 12, dtype=torch.float32
+        ).reshape(16, 12),
+        f"{prefix}.shared_experts.gate_proj.lora_B.weight": torch.arange(
+            20 * 16, dtype=torch.float32
+        ).reshape(20, 16),
+    }
+    safetensors.torch.save_file(
+        tensors, tmp_path / "adapter_model.safetensors"
+    )
+    helper = PEFTHelper(
+        r=16,
+        lora_alpha=32,
+        target_modules=["gate_proj", "up_proj", "down_proj"],
+    )
+    expected_modules = {
+        "experts.0.gate_proj",
+        "experts.0.up_proj",
+        "experts.0.down_proj",
+        "gate_proj",
+    }
+
+    sliced = LoRAModel.from_local_checkpoint(
+        str(tmp_path),
+        expected_modules,
+        peft_helper=helper,
+        lora_model_id=1,
+        device="cpu",
+        moe_tp_spec=MoETPLoadSpec(tp_rank=2, tp_size=4),
+    )
+
+    gate = sliced.loras["model.layers.3.mlp.experts.0.gate_proj"]
+    torch.testing.assert_close(
+        gate.lora_a, tensors[f"{prefix}.experts.0.gate_proj.lora_A.weight"][8:12]
+    )
+    torch.testing.assert_close(
+        gate.lora_b, tensors[f"{prefix}.experts.0.gate_proj.lora_B.weight"][10:15]
+    )
+    down = sliced.loras["model.layers.3.mlp.experts.0.down_proj"]
+    torch.testing.assert_close(
+        down.lora_a, tensors[f"{prefix}.experts.0.down_proj.lora_A.weight"][:, 10:15]
+    )
+    torch.testing.assert_close(
+        down.lora_b, tensors[f"{prefix}.experts.0.down_proj.lora_B.weight"][6:9]
+    )
+    shared = sliced.loras["model.layers.3.mlp.shared_experts.gate_proj"]
+    torch.testing.assert_close(
+        shared.lora_a,
+        tensors[f"{prefix}.shared_experts.gate_proj.lora_A.weight"],
+    )
+    torch.testing.assert_close(
+        shared.lora_b,
+        tensors[f"{prefix}.shared_experts.gate_proj.lora_B.weight"],
+    )

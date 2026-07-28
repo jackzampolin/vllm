@@ -151,6 +151,7 @@ class WorkerLoRAManager:
                 weights_mapper=hf_to_vllm_mapper,
                 skip_prefixes=lora_skip_prefixes,
                 moe_ep_spec=self._adapter_manager.moe_ep_load_spec,
+                moe_tp_spec=self._adapter_manager.moe_tp_load_spec,
             )
             # Stamp the on-disk MoE layout onto the loaded model so the
             # adapter manager can route 3D-format checkpoints through the
