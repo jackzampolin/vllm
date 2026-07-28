@@ -311,9 +311,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         # w13_lora_a shape (num_experts,rank,input_size)
         current_lora_rank = w13_lora_a.shape[1]
+        shard_size = self.w13_lora_a_stacked[0].shape[2]
+        if current_lora_rank == shard_size:
+            return w13_lora_a
         assert current_lora_rank % self.tp_size == 0
         # Based on S-LoRA, we slice W13/W1/W3 A along the rank dim.
-        shard_size = self.w13_lora_a_stacked[0].shape[2]
         start_idx = self.tp_rank * shard_size
         end_idx = (self.tp_rank + 1) * shard_size
         return w13_lora_a[:, start_idx:end_idx, :]
@@ -324,6 +326,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         # w13_lora_b shape (num_experts,output_size,rank)
         shard_size = self.intermediate_size_per_partition
+        if w13_lora_b.shape[1] == shard_size:
+            return w13_lora_b
         start_idx = self.tp_rank * shard_size
         end_idx = (self.tp_rank + 1) * shard_size
 
@@ -337,6 +341,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             return w2_lora_a
         # w2_lora_a shape (num_experts,rank,input_size)
         shard_size = self.intermediate_size_per_partition
+        if w2_lora_a.shape[2] == shard_size:
+            return w2_lora_a
         start_idx = self.tp_rank * shard_size
         end_idx = (self.tp_rank + 1) * shard_size
 
@@ -351,6 +357,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # Based on S-LoRA, we slice W2 B along the hidden_size dim.
         # w2_lora_b shape (num_experts,output_size,rank)
         shard_size = self.w2_lora_b_stacked[0].shape[2]
+        if w2_lora_b.shape[1] == shard_size:
+            return w2_lora_b
         start_idx = self.tp_rank * shard_size
         end_idx = (self.tp_rank + 1) * shard_size
 

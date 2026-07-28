@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from transformers import PretrainedConfig
 
+from vllm import envs
 from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -39,6 +40,13 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEQuantConfig,
     MoEActivation,
     RoutedExperts,
+)
+from vllm.model_executor.layers.fused_moe.config import (
+    FUSED_MOE_UNQUANTIZED_CONFIG,
+)
+from vllm.model_executor.layers.fused_moe.modular_kernel import (
+    FusedMoEExpertsModular,
+    FusedMoEPrepareAndFinalizeModular,
 )
 from vllm.model_executor.layers.linear import (
     LinearBase,
@@ -1137,7 +1145,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        del params_dtype, extra_weight_attrs
+        del extra_weight_attrs
         if self.moe.moe_parallel_config.use_ep:
             raise NotImplementedError(
                 "EXL3 correctness MoE currently supports TP but not expert parallelism"
@@ -1150,6 +1158,20 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer.exl3_tp_size = self.moe.moe_parallel_config.tp_size
         layer.exl3_hidden_size = hidden_size
         layer.exl3_intermediate_size_per_partition = intermediate_size_per_partition
+        # FusedMoEModularMethod uses the conventional logical weight shapes to
+        # size workspaces and configure Punica. EXL3 owns its physical tensors
+        # separately, so these zero-storage meta tensors are shape descriptors
+        # only and never participate in a GEMM or checkpoint load.
+        layer.w13_weight = torch.empty(
+            (num_experts, 2 * intermediate_size_per_partition, hidden_size),
+            dtype=params_dtype,
+            device="meta",
+        )
+        layer.w2_weight = torch.empty(
+            (num_experts, hidden_size, intermediate_size_per_partition),
+            dtype=params_dtype,
+            device="meta",
+        )
         rank_sliced = self.quant_config.rank_sliced_metadata is not None
         if rank_sliced:
             checkpoint_tp = int(self.quant_config.rank_sliced_metadata["tp"])
@@ -1173,9 +1195,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             # No silent fallback: a wrong capacity here puts the target and the
             # rank-sliced MTP draft on different plans with no error, which is
             # exactly the class of mismatch that corrupts only at scale.
-            if scheduler_config is None or getattr(
-                scheduler_config, "max_num_batched_tokens", None
-            ) is None:
+            if (
+                scheduler_config is None
+                or getattr(scheduler_config, "max_num_batched_tokens", None) is None
+            ):
                 raise ValueError(
                     "EXL3 rank-sliced MoE requires scheduler_config."
                     "max_num_batched_tokens to plan its Trellis arena; refusing to "
@@ -1228,6 +1251,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         if self.quant_config.rank_sliced_metadata is None:
             self._shard_tensors_for_tensor_parallel(layer)
         device = layer.w13_trellis.device
+        # w13_weight/w2_weight are zero-storage meta shape descriptors. The
+        # generic LoRA wrapper must allocate adapter buffers beside the
+        # physical EXL3 slabs, not on the descriptor device.
+        layer.lora_device = device
         for prefix in ("w13", "w2"):
             for attr in ("suh", "svh", "trellis", "mcg", "mul1"):
                 param = getattr(layer, f"{prefix}_{attr}")
@@ -1470,7 +1497,31 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         self, layer: RoutedExperts
     ) -> FusedMoEQuantConfig | None:
         del layer
-        return None
+        # The physical experts remain EXL3-quantized. This descriptor tells the
+        # modular prepare/finalize layer to leave activations unquantized.
+        return FUSED_MOE_UNQUANTIZED_CONFIG
+
+    def select_gemm_impl(
+        self,
+        prepare_finalize: FusedMoEPrepareAndFinalizeModular,
+        layer: RoutedExperts,
+    ) -> FusedMoEExpertsModular:
+        del prepare_finalize
+        from vllm.model_executor.layers.fused_moe.experts.exl3_trellis import (
+            Exl3TrellisLoRAExperts,
+        )
+
+        if self.quant_config.rank_sliced_metadata is None:
+            raise NotImplementedError(
+                "EXL3 routed LoRA currently requires a rank-sliced checkpoint"
+            )
+        assert self.moe_quant_config is not None
+        return Exl3TrellisLoRAExperts(
+            self.moe,
+            self.moe_quant_config,
+            self,
+            layer,
+        )
 
     @property
     def topk_indices_dtype(self) -> torch.dtype | None:
@@ -1695,8 +1746,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             max_trellis_m,
             block_m,
             (
-                f"trellis block_m={prefill_block_m} "
-                f"arena={prefill_arena_mib:.1f}MiB"
+                f"trellis block_m={prefill_block_m} arena={prefill_arena_mib:.1f}MiB"
                 if prefill_plan is not None
                 else "parity"
             ),
@@ -1840,6 +1890,97 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 0.0,
             )
         return out32.to(x.dtype)
+
+    def bind_rank_sliced_lora(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        *,
+        output: torch.Tensor,
+    ):
+        """Bind the planned split Trellis pipeline for an active adapter."""
+        if (
+            torch.cuda.is_current_stream_capturing()
+            and not envs.VLLM_EXL3_LORA_EXPERIMENTAL_GRAPHS
+        ):
+            raise RuntimeError(
+                "Dynamic EXL3 LoRA CUDA graph capture is disabled until adapter "
+                "switching parity passes; launch with --enforce-eager."
+            )
+        runtime = self._rank_sliced_runtime(layer, x, topk_ids)
+        if "lora_trellis_plan" not in runtime:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "EXL3 LoRA split plans must be created by adapter warmup "
+                    "before CUDA graph capture"
+                )
+            api = runtime["api"]
+
+            def _plan_lora(base_plan):
+                if base_plan is None:
+                    return None, None
+                plan = api.plan_lora(base_plan.caps)
+                scratch_spec = plan.scratch_specs()[0]
+                scratch = torch.empty(
+                    scratch_spec.shape,
+                    dtype=scratch_spec.dtype,
+                    device=scratch_spec.device,
+                )
+                return plan, scratch
+
+            lora_plan, lora_scratch = _plan_lora(runtime["trellis_plan"])
+            prefill_plan, prefill_scratch = _plan_lora(runtime["prefill_plan"])
+            runtime["lora_trellis_plan"] = lora_plan
+            runtime["lora_trellis_scratch"] = lora_scratch
+            runtime["lora_prefill_plan"] = prefill_plan
+            runtime["lora_prefill_scratch"] = prefill_scratch
+            scratch_mib = (
+                lora_scratch.numel() * lora_scratch.element_size()
+                + (
+                    0
+                    if prefill_scratch is None
+                    else prefill_scratch.numel() * prefill_scratch.element_size()
+                )
+            ) / (1 << 20)
+            logger.info_once(
+                "EXL3 LoRA split runtime planned: decode capacity=%d, "
+                "prefill capacity=%s, scratch=%.1f MiB",
+                int(runtime["max_trellis_m"]),
+                (
+                    "disabled"
+                    if prefill_plan is None
+                    else str(runtime["max_batched_tokens"])
+                ),
+                scratch_mib,
+            )
+
+        m = int(x.shape[0])
+        if m <= runtime["max_trellis_m"]:
+            plan = runtime["lora_trellis_plan"]
+            scratch = runtime["lora_trellis_scratch"]
+        else:
+            if m > runtime["max_batched_tokens"]:
+                raise ValueError(
+                    "EXL3 LoRA batch exceeds its planned capacity: "
+                    f"m={m}, capacity={runtime['max_batched_tokens']}"
+                )
+            plan = runtime["lora_prefill_plan"]
+            scratch = runtime["lora_prefill_scratch"]
+            if plan is None:
+                raise RuntimeError(
+                    "EXL3 LoRA prefill needs VLLM_EXL3_PREFILL_TRELLIS=1"
+                )
+        return runtime["api"].bind_lora(
+            plan,
+            scratch=scratch,
+            a=x,
+            weights=layer.exl3_trellis_weights,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            output=output,
+        )
 
     def apply(
         self,

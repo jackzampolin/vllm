@@ -33,6 +33,16 @@ def test_get_lora_device_ark_linear():
     assert _get_lora_device(base_layer) == base_layer.ark_linear.qweight.device
 
 
+def test_get_lora_device_explicit_backend_device_precedes_meta_weight():
+    base_layer = nn.Module()
+    base_layer.weight = nn.Parameter(
+        torch.empty(1, device="meta"),
+        requires_grad=False,
+    )
+    base_layer.lora_device = torch.device("cpu")
+    assert _get_lora_device(base_layer) == torch.device("cpu")
+
+
 def test_get_lora_device_unsupported_raises():
     base_layer = nn.Module()
     with pytest.raises(ValueError, match="Unsupported base layer"):

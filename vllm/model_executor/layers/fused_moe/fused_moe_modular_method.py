@@ -103,6 +103,20 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert self.moe_kernel is not None
+        no_lora_fast_path = getattr(
+            self.moe_kernel.fused_experts,
+            "should_use_no_lora_fast_path",
+            None,
+        )
+        if no_lora_fast_path is not None and no_lora_fast_path():
+            return self.old_quant_method.apply(
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                shared_experts,
+                shared_experts_input,
+            )
         return self.moe_kernel.apply(
             hidden_states=x,
             w1=layer.w13_weight,
