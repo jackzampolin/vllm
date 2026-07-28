@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from transformers import PretrainedConfig
 
+from vllm import envs
 from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -1902,7 +1903,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         """Bind the planned split Trellis pipeline for an active adapter."""
         if (
             torch.cuda.is_current_stream_capturing()
-            and os.environ.get("VLLM_EXL3_LORA_EXPERIMENTAL_GRAPHS", "0") != "1"
+            and not envs.VLLM_EXL3_LORA_EXPERIMENTAL_GRAPHS
         ):
             raise RuntimeError(
                 "Dynamic EXL3 LoRA CUDA graph capture is disabled until adapter "

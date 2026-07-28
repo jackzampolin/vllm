@@ -5,13 +5,13 @@
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm import envs
 from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
@@ -62,11 +62,9 @@ class Exl3TrellisLoRAExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         self.intermediate_size = moe_config.intermediate_size_per_partition
         self.hidden_size = moe_config.hidden_dim
         self.topk = moe_config.experts_per_token
-        self.use_eager_oracle = os.environ.get("VLLM_EXL3_LORA_ORACLE", "0") == "1"
+        self.use_eager_oracle = envs.VLLM_EXL3_LORA_ORACLE
         vllm_config = get_current_vllm_config_or_none()
-        experimental_graphs = (
-            os.environ.get("VLLM_EXL3_LORA_EXPERIMENTAL_GRAPHS", "0") == "1"
-        )
+        experimental_graphs = envs.VLLM_EXL3_LORA_EXPERIMENTAL_GRAPHS
         if (
             vllm_config is not None
             and not vllm_config.model_config.enforce_eager

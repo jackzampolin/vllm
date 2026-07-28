@@ -335,6 +335,8 @@ if TYPE_CHECKING:
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
+    VLLM_EXL3_LORA_ORACLE: bool = False
+    VLLM_EXL3_LORA_EXPERIMENTAL_GRAPHS: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
@@ -2282,6 +2284,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_PREFILL_CHUNK": lambda: os.getenv("VLLM_EXL3_PREFILL_CHUNK"),
     "VLLM_EXL3_PREFILL_TRELLIS": lambda: os.getenv("VLLM_EXL3_PREFILL_TRELLIS"),
     "VLLM_EXL3_PREFILL_BLOCK_M": lambda: os.getenv("VLLM_EXL3_PREFILL_BLOCK_M"),
+    "VLLM_EXL3_LORA_ORACLE": lambda: bool(
+        int(os.getenv("VLLM_EXL3_LORA_ORACLE", "0"))
+    ),
+    "VLLM_EXL3_LORA_EXPERIMENTAL_GRAPHS": lambda: bool(
+        int(os.getenv("VLLM_EXL3_LORA_EXPERIMENTAL_GRAPHS", "0"))
+    ),
     # Prebuilt exllamav3 extension location and torch-ABI compatibility shim.
     "VLLM_EXL3_EXT_PATH": lambda: os.getenv("VLLM_EXL3_EXT_PATH"),
     "VLLM_EXL3_ABI_SHIM": lambda: os.getenv("VLLM_EXL3_ABI_SHIM"),
