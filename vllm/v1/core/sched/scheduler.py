@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -325,6 +326,21 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        mamba_block_sizes = [
+            group.kv_cache_spec.block_size
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        ]
+        self.mamba_block_size = math.lcm(*mamba_block_sizes)
+        self.mamba_eagle_block_sizes = tuple(
+            manager.block_size
+            for group, manager in zip(
+                kv_cache_config.kv_cache_groups,
+                self.kv_cache_manager.coordinator.single_type_managers,
+                strict=True,
+            )
+            if group.is_eagle_group
+        )
         self.mamba_has_sliding_eagle_group = self.use_eagle and any(
             isinstance(group.kv_cache_spec, SlidingWindowSpec)
             and group.kv_cache_spec.dcp_replicated
@@ -413,13 +429,29 @@ class Scheduler(SchedulerInterface):
         if start >= prefill_end:
             return num_new_tokens
 
-        block_size = self.cache_config.block_size
+        block_size = getattr(self, "mamba_block_size", self.cache_config.block_size)
         # The last block-aligned position whose state can be cached. With
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
         last_cache_position = request.num_tokens - request.num_tokens % block_size
         if self.use_eagle and not getattr(self, "mamba_has_sliding_eagle_group", False):
-            last_cache_position = max(last_cache_position - block_size, 0)
+            # EAGLE drops the last complete draft-attention block. Convert the
+            # resulting maximum reusable prefix to the recurrent-state grid.
+            # Older configurations without an annotated EAGLE group retain
+            # the conservative one-Mamba-block behavior.
+            eagle_block_sizes = getattr(self, "mamba_eagle_block_sizes", ()) or (
+                block_size,
+            )
+            eagle_cache_position = min(
+                max(
+                    request.num_tokens
+                    - request.num_tokens % eagle_block_size
+                    - eagle_block_size,
+                    0,
+                )
+                for eagle_block_size in eagle_block_sizes
+            )
+            last_cache_position = eagle_cache_position // block_size * block_size
 
         end = start + num_new_tokens
         use_internal_checkpoint = (
