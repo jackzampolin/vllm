@@ -443,7 +443,9 @@ class Glm5NextDecoderLayer(nn.Module):
             ):
                 b12x_mhc = get_b12x_mhc()
                 if b12x_mhc is not None and b12x_mhc.is_supported():
-                    from vllm.models.deepseek_v4.nvidia.b12x import B12xMHCResidual
+                    from vllm.models.glm5next.nvidia.b12x_mhc import (
+                        B12xMHCResidual,
+                    )
 
                     self._b12x_mhc = B12xMHCResidual(
                         hidden_size=self.hidden_size,
