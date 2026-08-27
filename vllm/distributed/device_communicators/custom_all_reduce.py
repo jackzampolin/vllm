@@ -44,6 +44,10 @@ _B12X_PCIE_MAX_CONCURRENT_CHANNELS = 2
 # B12X TP12/TP16 uses one ordered bounded-degree channel. Distinct graph
 # owners serialize their collectives through that channel.
 _B12X_PCIE_SINGLE_CHANNEL_WORLD_SIZES = frozenset((12, 16))
+# This is the generic one-shot band used when B12X has no qualified
+# shape-specific extension. Keep it aligned with the environment default in
+# ``vllm.envs``; numeric operator overrides bypass automatic route selection.
+_B12X_PCIE_AUTO_GENERIC_MAX_SIZE = 84 * 1024
 
 
 def _get_pcie_allreduce_backend() -> str:
@@ -122,9 +126,15 @@ def _b12x_pcie_allreduce_max_size(world_size: int) -> int:
     """
 
     configured = os.getenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE")
-    if configured is not None:
+    automatic = configured is None or configured.strip().lower() == "auto"
+    if not automatic:
+        assert configured is not None
         return _parse_byte_size(configured)
-    default = _parse_byte_size(envs.VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE)
+    default = (
+        _B12X_PCIE_AUTO_GENERIC_MAX_SIZE
+        if configured is not None
+        else _parse_byte_size(envs.VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE)
+    )
     recommended_max_bytes = _load_b12x_pcie_recommended_max_bytes()
     if recommended_max_bytes is None:
         return default
@@ -138,6 +148,21 @@ def _b12x_pcie_allreduce_max_size(world_size: int) -> int:
             default,
         )
     return resolved
+
+
+def _b12x_pcie_plain_route_generic_max_size() -> int | None:
+    """Return the generic B12X route band, or ``None`` for a numeric override.
+
+    An absent value or the literal ``auto`` enables B12X's shape policy.
+    Numeric values preserve the operator's explicit size-only dispatch.
+    """
+
+    configured = os.getenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE")
+    if configured is None:
+        return _parse_byte_size(envs.VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE)
+    if configured.strip().lower() == "auto":
+        return _B12X_PCIE_AUTO_GENERIC_MAX_SIZE
+    return None
 
 
 def _b12x_pcie_oneshot_limits(world_size: int) -> tuple[int, int, int]:
@@ -364,6 +389,7 @@ class CustomAllreduce:
         self._pcie_capture_stream: torch.cuda.Stream | None = None
         self._pcie_capture_channel_id: str | None = None
         self._pcie_allreduce_max_size: int | None = None
+        self._pcie_plain_route_generic_max_size: int | None = None
         self._pcie_fused_add_rms_norm_max_size: int | None = None
         self._cpp_ar_cutoff_size: int | None = None
         self._cpp_ar_ignore_cutoff_max_rows = 0
@@ -599,6 +625,10 @@ class CustomAllreduce:
                 self._pcie_fused_add_rms_norm_max_size,
                 pcie_oneshot_buffer_size,
             ) = _b12x_pcie_oneshot_limits(world_size)
+            if pcie_backend == "b12x":
+                self._pcie_plain_route_generic_max_size = (
+                    _b12x_pcie_plain_route_generic_max_size()
+                )
             if self.nccl_group is None:
                 logger.warning(
                     "Custom allreduce is disabled because %s PCIe oneshot "
@@ -1037,13 +1067,25 @@ class CustomAllreduce:
             return False
         if self._pcie_runtime is not None:
             inp_size = inp.numel() * inp.element_size()
+            channel = self._pcie_runtime.for_stream(
+                self._pcie_runtime_stream(),
+                channel_id=self._pcie_runtime_channel_id(),
+            )
+            route_plain = getattr(channel, "should_route_plain_allreduce", None)
+            if (
+                route_plain is not None
+                and self._pcie_plain_route_generic_max_size is not None
+            ):
+                runtime_accepts = route_plain(
+                    inp,
+                    generic_max_bytes=self._pcie_plain_route_generic_max_size,
+                )
+            else:
+                runtime_accepts = channel.should_allreduce(inp)
             use_custom = (
                 self._pcie_allreduce_max_size is not None
                 and inp_size <= self._pcie_allreduce_max_size
-                and self._pcie_runtime.for_stream(
-                    self._pcie_runtime_stream(),
-                    channel_id=self._pcie_runtime_channel_id(),
-                ).should_allreduce(inp)
+                and runtime_accepts
             )
             if (
                 not use_custom

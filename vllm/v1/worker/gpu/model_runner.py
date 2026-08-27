@@ -155,7 +155,11 @@ from vllm.v1.worker.gpu.spec_decode.utils import (
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
+from vllm.v1.worker.utils import (
+    KVBlockZeroer,
+    copy_kv_cache_blocks_inplace,
+    get_uniform_decode_token_count,
+)
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
@@ -510,6 +514,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_num_logits=self.max_num_reqs * self.decode_query_len,
                 vocab_size=self.vocab_size,
                 device=self.device,
+                num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,
             )
 
         if self.is_pooling_model and self.is_last_pp_rank:
@@ -728,6 +733,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         uniform_query_len: int | None = None,
         skip_eplb: bool = False,
         is_profile: bool = False,
+        single_request_prefill: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if self.is_encoder_only:
@@ -740,7 +746,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Create a dummy scheduler output.
         num_reqs = min(num_tokens, self.max_num_reqs)
-        if uniform_decode:
+        if single_request_prefill:
+            if uniform_decode:
+                raise ValueError(
+                    "single_request_prefill and uniform_decode are mutually exclusive"
+                )
+            num_reqs = 1
+        elif uniform_decode:
             if uniform_query_len is not None:
                 # Sub-depth uniform decode (SPS curve profiling): dispatch a
                 # capacity-pruned verify shape, e.g. one request at a query
@@ -870,6 +882,49 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return hidden_states, sample_hidden_states
 
     @torch.inference_mode()
+    def _make_dummy_spec_decode_batch(self, num_reqs: int) -> InputBatch:
+        """Construct a verifier batch at the configured speculative width."""
+        assert self.num_speculative_steps > 0
+        assert self.decode_query_len > self.num_speculative_steps
+
+        num_logits_per_req = self.decode_query_len
+        num_logits = num_reqs * num_logits_per_req
+        input_batch = InputBatch.make_dummy(
+            num_reqs,
+            num_logits,
+            self.input_buffers,
+            max_req_tokens=num_logits_per_req,
+        )
+
+        num_draft_tokens_per_req = np.full(
+            num_reqs, self.num_speculative_steps, dtype=np.int32
+        )
+        cu_num_logits_np = np.arange(
+            0, num_logits + 1, num_logits_per_req, dtype=np.int32
+        )
+        local_pos = torch.arange(
+            num_logits_per_req, dtype=torch.int32, device=self.device
+        ).repeat(num_reqs)
+
+        input_batch.num_draft_tokens = int(num_draft_tokens_per_req.sum())
+        input_batch.num_draft_tokens_per_req = num_draft_tokens_per_req
+        input_batch.valid_num_draft_tokens_per_req = num_draft_tokens_per_req
+        input_batch.expanded_idx_mapping = input_batch.idx_mapping.repeat_interleave(
+            num_logits_per_req
+        )
+        input_batch.expanded_local_pos = local_pos
+        input_batch.positions.copy_(local_pos)
+        input_batch.logits_indices = torch.arange(
+            num_logits, dtype=torch.int64, device=self.device
+        )
+        input_batch.cu_num_logits_np = cu_num_logits_np
+        input_batch.cu_num_logits = torch.from_numpy(cu_num_logits_np).to(
+            device=self.device
+        )
+        input_batch.is_padding.fill_(False)
+        return input_batch
+
+    @torch.inference_mode()
     def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
         num_reqs = hidden_states.shape[0]
         logits = self.model.compute_logits(hidden_states)
@@ -882,6 +937,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # during actual execution.
         assert self.sampler is not None
         self.sampler(logits, dummy_input_batch)
+
+        if self.rejection_sampler is None or self.num_speculative_steps == 0:
+            return
+
+        assert self.speculator is not None
+        del logits
+        verify_hidden_states = hidden_states.repeat_interleave(
+            self.decode_query_len, dim=0
+        )
+        verify_logits = self.model.compute_logits(verify_hidden_states)
+        dummy_spec_batch = self._make_dummy_spec_decode_batch(num_reqs)
+        self.rejection_sampler(
+            verify_logits,
+            dummy_spec_batch,
+            self.speculator.draft_logits,
+        )
 
     @torch.inference_mode()
     def _dummy_pooler_run(self, hidden_states: torch.Tensor) -> None:
@@ -939,6 +1010,43 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         del hidden_states, sample_hidden_states
         self.reset_encoder_cache()
         gc.collect()
+
+    @torch.inference_mode()
+    def profile_single_request_prefill(self) -> None:
+        """Profile the maximum text-prefill shape before sizing the KV cache.
+
+        The ordinary V2 profile omits attention and distributes
+        ``max_num_batched_tokens`` across ``max_num_seqs`` requests. Sparse
+        attention can initialize persistent metadata buffers and reach a larger
+        transient peak when one request consumes the complete token budget.
+        A temporary minimal KV cache exposes that serving path while dummy slot
+        mappings suppress cache writes.
+        """
+        with set_current_vllm_config(self.vllm_config):
+            self._init_minimal_kv_cache_for_profiling()
+
+        hidden_states: torch.Tensor | None = None
+        sample_hidden_states: torch.Tensor | None = None
+        try:
+            hidden_states, sample_hidden_states = self._dummy_run(
+                self.max_num_tokens,
+                skip_eplb=True,
+                is_profile=True,
+                single_request_prefill=True,
+            )
+            if self.is_last_pp_rank:
+                assert hidden_states is not None
+                assert sample_hidden_states is not None
+                if self.pooling_runner is None:
+                    self._dummy_sampler_run(sample_hidden_states)
+                else:
+                    self._dummy_pooler_run(hidden_states)
+            torch.accelerator.synchronize()
+        finally:
+            hidden_states = None
+            sample_hidden_states = None
+            self.reset_encoder_cache()
+            self._cleanup_cudagraph_memory_profile()
 
     def post_kv_cache_wake_up(self) -> None:
         self.block_tables.init_block_table_layout_tensors()
@@ -1339,25 +1447,77 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output.kv_cache_block_copies,
             )
 
+    def gather_batch_req_state(
+        self, scheduler_output: SchedulerOutput, dummy_run: bool
+    ) -> tuple["BatchReqState | None", int | None]:
+        """Classify scheduled requests before selecting a CUDA graph.
+
+        A prompt chunk can have the same token-count shape as a speculative
+        decode batch. Request state, rather than shape alone, determines
+        whether a FULL decode graph is eligible.
+
+        Args:
+            scheduler_output: Scheduler decisions for the model invocation.
+            dummy_run: Whether the invocation constructs graph-capture inputs.
+
+        Returns:
+            A tuple containing ordered CPU request state (None for a dummy run)
+            and the common decode query length when FULL replay is eligible.
+        """
+        num_tokens_per_req = scheduler_output.num_scheduled_tokens
+        num_reqs = len(num_tokens_per_req)
+        num_tokens = scheduler_output.total_num_scheduled_tokens
+        max_query_len = max(num_tokens_per_req.values())
+
+        if dummy_run:
+            return None, get_uniform_token_count(num_reqs, num_tokens, max_query_len)
+
+        req_ids = sort_batch_req_ids(num_tokens_per_req, self.decode_query_len)
+        num_scheduled_tokens = np.fromiter(
+            map(num_tokens_per_req.__getitem__, req_ids),
+            dtype=np.int32,
+            count=num_reqs,
+        )
+        idx_mapping_np = np.fromiter(
+            map(self.req_states.req_id_to_index.__getitem__, req_ids),
+            dtype=np.intp,
+            count=num_reqs,
+        )
+        prefill_len_np = self.req_states.prefill_len.np[idx_mapping_np]
+        num_computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens[
+            idx_mapping_np
+        ]
+        is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
+        batch_req_state = BatchReqState(
+            req_ids=req_ids,
+            num_scheduled_tokens=num_scheduled_tokens,
+            idx_mapping_np=idx_mapping_np,
+            prefill_len_np=prefill_len_np,
+            num_computed_prefill_tokens_np=num_computed_prefill_tokens_np,
+            is_prefilling_np=is_prefilling_np,
+            has_prefill=bool(is_prefilling_np.any()),
+        )
+        return batch_req_state, get_uniform_decode_token_count(
+            num_reqs,
+            num_tokens,
+            max_query_len,
+            batch_req_state.has_prefill,
+        )
+
     def prepare_inputs(
         self,
         scheduler_output: SchedulerOutput,
+        batch_req_state: "BatchReqState",
         batch_desc: BatchExecutionDescriptor,
         max_query_len: int,
     ) -> InputBatch:
         num_tokens = scheduler_output.total_num_scheduled_tokens
         num_tokens_after_padding = batch_desc.num_tokens
-        num_tokens_per_req = scheduler_output.num_scheduled_tokens
-        num_reqs = len(num_tokens_per_req)
-
-        # batch_idx -> req_id
-        req_ids = sort_batch_req_ids(num_tokens_per_req, self.decode_query_len)
-        numtoks_iter = map(num_tokens_per_req.__getitem__, req_ids)
-        num_scheduled_tokens = np.fromiter(numtoks_iter, dtype=np.int32, count=num_reqs)
-
-        idx_mapping_iter = map(self.req_states.req_id_to_index.__getitem__, req_ids)
-        idx_mapping_np = np.fromiter(idx_mapping_iter, dtype=np.intp, count=num_reqs)
+        req_ids = batch_req_state.req_ids
+        num_scheduled_tokens = batch_req_state.num_scheduled_tokens
+        idx_mapping_np = batch_req_state.idx_mapping_np
         idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+        num_reqs = len(req_ids)
 
         # Get the number of draft tokens for each request.
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
@@ -1421,13 +1581,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         async_copy_to_gpu(query_start_loc_np, out=self.input_buffers.query_start_loc)
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
-        prefill_len_np = self.req_states.prefill_len.np[idx_mapping_np]
-        computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens
-        num_computed_prefill_tokens_np = computed_prefill_tokens_np[idx_mapping_np]
-        is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
-
         # Get prefill tokens if any.
-        if np.any(is_prefilling_np):
+        if batch_req_state.has_prefill:
             prepare_prefill_inputs(
                 self.input_buffers.input_ids,
                 self.req_states.next_prefill_tokens,
@@ -1518,9 +1673,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_seq_len_upper_bound=max_seq_len_upper_bound,
             dcp_local_seq_lens=dcp_local_seq_lens,
             num_computed_tokens_np=num_computed_tokens_np,
-            prefill_len_np=prefill_len_np,
-            num_computed_prefill_tokens_np=num_computed_prefill_tokens_np,
-            is_prefilling_np=is_prefilling_np,
+            prefill_len_np=batch_req_state.prefill_len_np,
+            num_computed_prefill_tokens_np=(
+                batch_req_state.num_computed_prefill_tokens_np
+            ),
+            is_prefilling_np=batch_req_state.is_prefilling_np,
             max_seq_len_np=max_seq_len_np,
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
@@ -1616,6 +1773,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch,
                     grammar_output.structured_output_request_ids,
                     grammar_output.grammar_bitmask,
+                    grammar_output.num_spec_tokens,
                 )
 
         if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
@@ -1713,7 +1871,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_reqs = len(scheduler_output.num_scheduled_tokens)
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
-        uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+        batch_req_state, uniform_tok_count = self.gather_batch_req_state(
+            scheduler_output, dummy_run
+        )
         # Per-request token bound for graph dispatch: varlen spec-decode graphs
         # are captured for at most `max_req_tokens` tokens per request, so a
         # batch may only replay one if its longest request fits.
@@ -1800,9 +1960,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not dummy_run:
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
+            assert batch_req_state is not None
             with record_function_or_nullcontext("vllm:v2/target/prepare_inputs"):
                 input_batch = self.prepare_inputs(
-                    scheduler_output, batch_desc, max_query_len
+                    scheduler_output,
+                    batch_req_state,
+                    batch_desc,
+                    max_query_len,
                 )
             _prepare_kquant_capture_batch(input_batch)
             phase = _profile_batch_phase(input_batch)
@@ -2390,6 +2554,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @property
     def pcp_manager_cls(self) -> type[pcp.PCPManager]:
         return pcp.PCPManager
+
+
+class BatchReqState(NamedTuple):
+    """CPU request state for a scheduled batch, in execution order."""
+
+    req_ids: list[str]
+    num_scheduled_tokens: np.ndarray
+    idx_mapping_np: np.ndarray
+    prefill_len_np: np.ndarray
+    num_computed_prefill_tokens_np: np.ndarray
+    is_prefilling_np: np.ndarray
+    has_prefill: bool
 
 
 class ExecuteModelState(NamedTuple):

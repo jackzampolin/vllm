@@ -110,6 +110,7 @@ def test_memory_profile_replays_model_after_kernel_warmup(
     worker.device = "cuda:0"
     worker.model_runner = SimpleNamespace(
         profile_run=lambda: calls.append("profile"),
+        profile_single_request_prefill=lambda: calls.append("single-prefill"),
     )
     worker.vllm_config = SimpleNamespace()
     worker.get_model = lambda: object()
@@ -138,6 +139,7 @@ def test_memory_profile_replays_model_after_kernel_warmup(
         "kernel_warmup",
         ("reset_peak", "cuda:0"),
         "profile",
+        "single-prefill",
     ]
 
 
