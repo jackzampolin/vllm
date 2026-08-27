@@ -1105,9 +1105,12 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             and envs.VLLM_B12X_MLA_CKV_GATHER
         )
         max_ckv_tokens = envs.VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS
+        cp_kv_cache_interleave_size = int(
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
+        )
         self._ckv_capacity_tokens = (
             max_ckv_tokens + self.dcp_world_size - 1
-        ) // self.dcp_world_size + max_seqs * self.cp_kv_cache_interleave_size
+        ) // self.dcp_world_size + max_seqs * cp_kv_cache_interleave_size
         self._ckv_local_capacity = 0
 
         self._module = module
