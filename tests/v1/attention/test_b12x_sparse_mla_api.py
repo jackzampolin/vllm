@@ -7,10 +7,6 @@ from typing import Any
 
 import pytest
 import torch
-from vllm.models.deepseek_v32.b12x import B12xDeepseekV32Indexer
-from vllm.v1.attention.backends.b12x import B12xPagedAttentionBackend
-from vllm.v1.attention.backends.mla.b12x_indexer import B12xIndexerBackend
-from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm.config import AttentionConfig, set_current_vllm_config
 from vllm.model_executor.layers.attention.mla_attention import (
@@ -26,9 +22,12 @@ from vllm.models.deepseek_v32.attention import (
     DeepseekV32Indexer,
     _select_sparse_components,
 )
+from vllm.models.deepseek_v32.b12x import B12xDeepseekV32Indexer
 from vllm.platforms.interface import DeviceCapability
+from vllm.v1.attention.backends.b12x_attn import B12XPagedAttentionBackend
 from vllm.v1.attention.backends.mla import b12x_indexer as generic_b12x_indexer
 from vllm.v1.attention.backends.mla import b12x_mla_sparse
+from vllm.v1.attention.backends.mla.b12x_indexer import B12xIndexerBackend
 from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xGLM5NextMLASparseBackend,
     B12xGLM5NextMLASparseMetadataBuilder,
@@ -54,8 +53,11 @@ class _Workspace:
 
 
 def test_b12x_selector_routes_supported_attention_families() -> None:
-    assert AttentionConfig(backend="b12x").backend == AttentionBackendEnum.B12X
-    assert AttentionBackendEnum.B12X.get_class() is B12xPagedAttentionBackend
+    assert (
+        AttentionConfig(backend="b12x_attn").backend
+        == AttentionBackendEnum.B12X_ATTN
+    )
+    assert AttentionBackendEnum.B12X_ATTN.get_class() is B12XPagedAttentionBackend
     assert B12xMLASparseBackend.get_name() == "B12X"
     assert b12x_mla.DeepseekV4B12xSparseMLABackend.get_name() == "B12X"
     assert not B12xIndexerBackend.supports_device_cpu_query_lens_mismatch()
@@ -167,7 +169,6 @@ def test_b12x_glm5_next_cache_spec_and_layout(monkeypatch) -> None:
             attn_type="decoder",
         )
         packed = B12xMLASparseBackend.customize_spec(probe)
-        layouts = B12xMLASparseBackend.supported_kv_cache_layouts()
     packed_without_config_context = B12xMLASparseBackend.customize_spec(packed)
 
     assert invalid_reasons == []
@@ -179,7 +180,6 @@ def test_b12x_glm5_next_cache_spec_and_layout(monkeypatch) -> None:
     assert packed.page_size_padded == 64 * (528 + 33)
     assert packed.model_version == "glm5_next"
     assert packed_without_config_context == packed
-    assert layouts == (KVCacheLayout.BLHNC,)
 
 
 def test_b12x_glm5_next_keeps_hybrid_manager_page_unsplit() -> None:
@@ -188,9 +188,6 @@ def test_b12x_glm5_next_keeps_hybrid_manager_page_unsplit() -> None:
     assert len(supported) == 1
     assert supported[0].base == 64
     assert select_common_block_size(2304, [B12xGLM5NextMLASparseBackend]) == 2304
-    assert B12xGLM5NextMLASparseBackend.supported_kv_cache_layouts() == (
-        KVCacheLayout.BLHNC,
-    )
 
 
 def test_b12x_glm5_next_rejects_unaligned_dcp(monkeypatch) -> None:

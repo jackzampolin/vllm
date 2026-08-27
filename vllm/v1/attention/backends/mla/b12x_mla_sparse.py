@@ -40,7 +40,6 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 )
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
-from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
@@ -441,14 +440,6 @@ class B12xMLASparseBackend(AttentionBackend):
             * (_GLM_NEXT_CACHE_RECORD_BYTES + _GLM_NEXT_INDEX_TAIL_BYTES_PER_TOKEN),
             model_version="glm5_next",
         )
-
-    @classmethod
-    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
-        # Sparse index caches share manager blocks with their MLA layer. Keep
-        # the layer dimension inside the manager's block so block copies and
-        # swaps carry both cache regions together. DeepSeek-V4's index backend
-        # already imposes the same constraint, so this preserves its layout.
-        return (KVCacheLayout.BLHNC,)
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
