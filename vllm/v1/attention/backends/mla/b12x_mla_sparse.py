@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """B12x sparse MLA attention backend."""
 
+import os
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, ClassVar
 
@@ -111,6 +112,30 @@ def _selected_index_block_stride_rows(
         return block_size
     record_width = int(kv_cache.shape[-1])
     return int(kv_cache.stride(0)) // record_width
+
+
+def _use_b12x_sparse_decode_plan(
+    *,
+    max_query_len: int,
+    num_tokens: int,
+    num_reqs: int,
+    is_spec_decode: bool,
+    spec_extend_as_decode: bool,
+    spec_extend_as_decode_force: bool,
+    spec_decode_max_q: int,
+    max_tokens: int,
+) -> bool:
+    if max_query_len <= 1:
+        return True
+    use_spec_decode = spec_extend_as_decode and (
+        spec_extend_as_decode_force or is_spec_decode
+    )
+    return (
+        use_spec_decode
+        and max_query_len <= spec_decode_max_q
+        and num_tokens <= num_reqs * spec_decode_max_q
+        and num_tokens <= max_tokens
+    )
 
 
 class B12xMLASparseBackend(AttentionBackend):
@@ -279,6 +304,7 @@ class B12xMLASparseMetadata(AttentionMetadata):
     num_decodes: int
     num_prefills: int
     num_decode_tokens: int
+    is_spec_decode: bool = False
     prefill_max_seq_len: int = 0
     prefill: MLACommonPrefillMetadata | None = None
     prefill_query_lens_cpu: torch.Tensor | None = None
@@ -318,6 +344,10 @@ class B12xMLASparseMetadataBuilder(
         )
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         scheduler_config = vllm_config.scheduler_config
+        speculative_config = vllm_config.speculative_config
+        self.num_speculative_tokens = int(
+            getattr(speculative_config, "num_speculative_tokens", 0) or 0
+        )
         max_tokens = scheduler_config.max_num_batched_tokens
         self.cache_seq_lens_per_token_buffer = torch.empty(
             (max_tokens,), dtype=torch.int32, device=device
@@ -501,6 +531,15 @@ class B12xMLASparseMetadataBuilder(
             per_token_lens = self.cache_seq_lens_per_token_buffer[:num_tokens]
 
         metadata.cache_seq_lens_per_token = per_token_lens
+        metadata.is_spec_decode = False
+        if (
+            self.num_speculative_tokens > 0
+            and 1 < common.max_query_len <= self.num_speculative_tokens + 1
+            and common.is_prefilling is not None
+        ):
+            metadata.is_spec_decode = not bool(
+                torch.any(common.is_prefilling[: common.num_reqs])
+            )
         if metadata.num_prefills:
             prefill_start = metadata.num_decodes
             prefill_end = prefill_start + metadata.num_prefills + 1
@@ -676,6 +715,19 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 )
         self._max_tokens = max_tokens
         self._max_seqs = max_seqs
+        self._spec_decode_max_q = int(os.getenv("VLLM_B12X_MLA_SPEC_DECODE_MAX_Q", "8"))
+        spec_decode_mode = (
+            os.getenv("VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "auto").strip().lower()
+        )
+        disabled_modes = {"0", "false", "off", "no"}
+        forced_modes = {"1", "true", "on", "yes"}
+        if spec_decode_mode not in {"auto", *disabled_modes, *forced_modes}:
+            raise ValueError(
+                "VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE must be auto, 0, or 1 "
+                f"(got {spec_decode_mode!r})"
+            )
+        self._spec_extend_as_decode = spec_decode_mode not in disabled_modes
+        self._spec_extend_as_decode_force = spec_decode_mode in forced_modes
         self._kv_dtype = torch.uint8
         kernel_page_size = (
             int(vllm_config.cache_config.block_size) if self._is_glm_next else 64
@@ -783,9 +835,18 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 f"cache={cache_page_size}, metadata={metadata_page_size}, "
                 f"plan={self._kernel_page_size}"
             )
-        plan = (
-            self._decode_plan if attn_metadata.max_query_len <= 1 else self._extend_plan
+        num_tokens = int(q[0].shape[0] if isinstance(q, tuple) else q.shape[0])
+        use_decode = _use_b12x_sparse_decode_plan(
+            max_query_len=attn_metadata.max_query_len,
+            num_tokens=num_tokens,
+            num_reqs=attn_metadata.num_reqs,
+            is_spec_decode=attn_metadata.is_spec_decode,
+            spec_extend_as_decode=self._spec_extend_as_decode,
+            spec_extend_as_decode_force=self._spec_extend_as_decode_force,
+            spec_decode_max_q=self._spec_decode_max_q,
+            max_tokens=self._max_tokens,
         )
+        plan = self._decode_plan if use_decode else self._extend_plan
         q_spec = (
             (self._max_tokens, self._input_num_heads, self._q_head_dim),
             torch.bfloat16,
