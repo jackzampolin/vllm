@@ -3,8 +3,9 @@
 """B12x sparse MLA attention backend."""
 
 import os
+import weakref
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -179,6 +180,295 @@ def _use_b12x_full_ckv_gather(
         and num_tokens > min_tokens
         and num_tokens <= max_tokens
     )
+
+
+def _ckv_prefetch_ring_slots(depth: int) -> int:
+    return max(0, int(depth)) + 1
+
+
+def _ckv_prefetch_workspace_nbytes(
+    depth: int,
+    dcp_world_size: int,
+    local_capacity: int,
+    record_bytes: int,
+) -> int:
+    """Return one lane's local staging plus gathered-cache ring size."""
+    return (
+        (1 + _ckv_prefetch_ring_slots(depth) * int(dcp_world_size))
+        * int(local_capacity)
+        * int(record_bytes)
+    )
+
+
+def _ckv_prefetch_execution_lanes(num_ubatches: int, speculative: bool) -> int:
+    return max(1, int(num_ubatches)) * (2 if speculative else 1)
+
+
+def _ckv_prefetch_depth_within_budget(
+    requested_depth: int,
+    workspace_budget_bytes: int,
+    dcp_world_size: int,
+    local_capacity: int,
+    record_bytes: int,
+) -> int:
+    """Cap lookahead depth without removing the synchronous gather slot."""
+    requested_depth = max(0, int(requested_depth))
+    workspace_budget_bytes = int(workspace_budget_bytes)
+    if workspace_budget_bytes <= 0:
+        return requested_depth
+    for depth in range(requested_depth, -1, -1):
+        if (
+            _ckv_prefetch_workspace_nbytes(
+                depth,
+                dcp_world_size,
+                local_capacity,
+                record_bytes,
+            )
+            <= workspace_budget_bytes
+        ):
+            return depth
+    return 0
+
+
+def _ckv_prefetch_target_indices(
+    layer_idx: int,
+    depth: int,
+    layer_caches: list[torch.Tensor | None],
+    pending_layers: dict[int, tuple[Any, int]],
+) -> list[int]:
+    targets: list[int] = []
+    for distance in range(1, max(0, int(depth)) + 1):
+        target_idx = layer_idx + distance
+        if target_idx in pending_layers:
+            continue
+        if target_idx >= len(layer_caches) or layer_caches[target_idx] is None:
+            break
+        targets.append(target_idx)
+    return targets
+
+
+class _CKVPrefetchWorkspacePool:
+    """Preallocated CKV rings shared by attention layers on one device."""
+
+    def __init__(
+        self,
+        device: torch.device,
+        slot_nbytes: int,
+        max_slots: int,
+    ) -> None:
+        if slot_nbytes <= 0 or max_slots <= 0:
+            raise ValueError(
+                "CKV workspace pool requires positive slot size and count, got "
+                f"slot_nbytes={slot_nbytes} max_slots={max_slots}"
+            )
+        self.device = device
+        self.slot_nbytes = int(slot_nbytes)
+        self.max_slots = int(max_slots)
+        self.storage = torch.empty(
+            (self.slot_nbytes * self.max_slots,),
+            dtype=torch.uint8,
+            device=device,
+        )
+        self._free_slots = list(reversed(range(self.max_slots)))
+        self._leased_slots: set[int] = set()
+
+    def acquire(self) -> tuple[int, torch.Tensor]:
+        if not self._free_slots:
+            raise RuntimeError(
+                "CKV prefetch workspace pool exhausted. The runtime created more "
+                f"than {self.max_slots} execution lanes."
+            )
+        slot = self._free_slots.pop()
+        self._leased_slots.add(slot)
+        start = slot * self.slot_nbytes
+        return slot, self.storage.narrow(0, start, self.slot_nbytes)
+
+    def release(self, slot: int) -> None:
+        if slot not in self._leased_slots:
+            raise RuntimeError(f"CKV workspace slot {slot} is not leased")
+        self._leased_slots.remove(slot)
+        self._free_slots.append(slot)
+
+
+_CKV_PREFETCH_WORKSPACE_POOLS: dict[
+    tuple[str, int | None, int, int], _CKVPrefetchWorkspacePool
+] = {}
+
+
+def _get_ckv_prefetch_workspace_pool(
+    device: torch.device,
+    slot_nbytes: int,
+    max_slots: int,
+) -> _CKVPrefetchWorkspacePool:
+    key = (device.type, device.index, int(slot_nbytes), int(max_slots))
+    pool = _CKV_PREFETCH_WORKSPACE_POOLS.get(key)
+    if pool is None:
+        pool = _CKVPrefetchWorkspacePool(device, slot_nbytes, max_slots)
+        _CKV_PREFETCH_WORKSPACE_POOLS[key] = pool
+    return pool
+
+
+@dataclass(frozen=True)
+class _CKVWorkspaceIdentity:
+    device: torch.device
+    storage_data_ptr: int
+    storage_nbytes: int
+    data_ptr: int
+    storage_offset: int
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+    dtype: torch.dtype
+
+
+def _ckv_workspace_identity(workspace: torch.Tensor) -> _CKVWorkspaceIdentity:
+    storage = workspace.untyped_storage()
+    return _CKVWorkspaceIdentity(
+        device=workspace.device,
+        storage_data_ptr=storage.data_ptr(),
+        storage_nbytes=storage.nbytes(),
+        data_ptr=workspace.data_ptr(),
+        storage_offset=workspace.storage_offset(),
+        shape=tuple(workspace.shape),
+        stride=tuple(workspace.stride()),
+        dtype=workspace.dtype,
+    )
+
+
+class _CKVPrefetchState:
+    """Cross-layer state for one workspace allocation and execution lane."""
+
+    def __init__(
+        self,
+        workspace_identity: _CKVWorkspaceIdentity,
+        workspace: torch.Tensor,
+        workspace_pool: _CKVPrefetchWorkspacePool,
+    ) -> None:
+        self.workspace_identity = workspace_identity
+        self.workspace_storage_ref = weakref.ref(workspace.untyped_storage())
+        self.workspace_pool = workspace_pool
+        self.layer_caches: list[torch.Tensor | None] = []
+        self.pending_layers: dict[int, tuple[Any, int]] = {}
+        self.gather_stream: torch.cuda.Stream | None = None
+        self.ckv_workspace: torch.Tensor | None = None
+        self.ckv_workspace_slot: int | None = None
+        self.last_layer_idx: int | None = None
+
+    def begin_step(self) -> None:
+        self.wait_for_pending_writes()
+        self.pending_layers.clear()
+        self.last_layer_idx = None
+
+    def wait_for_pending_writes(self) -> None:
+        for event, _ in self.pending_layers.values():
+            event.wait()
+
+    def enter_layer(self, layer_idx: int) -> None:
+        if self.last_layer_idx is not None and layer_idx <= self.last_layer_idx:
+            self.begin_step()
+        self.last_layer_idx = layer_idx
+
+    def register_cache(self, layer_idx: int, kv_cache: torch.Tensor) -> None:
+        while len(self.layer_caches) <= layer_idx:
+            self.layer_caches.append(None)
+        self.layer_caches[layer_idx] = kv_cache
+
+    def get_gather_stream(self) -> torch.cuda.Stream:
+        if self.gather_stream is None:
+            self.gather_stream = torch.cuda.Stream(
+                device=self.workspace_identity.device
+            )
+        return self.gather_stream
+
+    def get_ckv_workspace(self, nbytes: int) -> torch.Tensor:
+        if nbytes != self.workspace_pool.slot_nbytes:
+            raise ValueError(
+                "CKV workspace size changed after persistent allocation: "
+                f"pool={self.workspace_pool.slot_nbytes} requested={nbytes}"
+            )
+        if self.ckv_workspace is None:
+            slot, workspace = self.workspace_pool.acquire()
+            self.ckv_workspace_slot = slot
+            self.ckv_workspace = workspace
+        return self.ckv_workspace
+
+    def close(self) -> None:
+        for event, _ in self.pending_layers.values():
+            event.synchronize()
+        self.pending_layers.clear()
+        self.last_layer_idx = None
+        if self.ckv_workspace_slot is not None:
+            self.workspace_pool.release(self.ckv_workspace_slot)
+            self.ckv_workspace_slot = None
+            self.ckv_workspace = None
+
+
+_CKV_PREFETCH_STATE_REGISTRIES: weakref.WeakSet = weakref.WeakSet()
+
+
+class _CKVPrefetchStateRegistry:
+    """Builder-owned states partitioned by lane-scoped query workspace."""
+
+    def __init__(self) -> None:
+        self.states: dict[_CKVWorkspaceIdentity, _CKVPrefetchState] = {}
+        self.workspace_pool: _CKVPrefetchWorkspacePool | None = None
+        _CKV_PREFETCH_STATE_REGISTRIES.add(self)
+
+    def _bind_workspace_pool(self, pool: _CKVPrefetchWorkspacePool) -> None:
+        if self.workspace_pool is None:
+            self.workspace_pool = pool
+        elif self.workspace_pool is not pool:
+            raise RuntimeError("CKV prefetch registry cannot switch workspace pools")
+
+    def _retire(self, identities: list[_CKVWorkspaceIdentity]) -> None:
+        for identity in identities:
+            self.states.pop(identity).close()
+
+    def _prune_released_workspaces(self) -> None:
+        self._retire(
+            [
+                identity
+                for identity, state in self.states.items()
+                if state.workspace_storage_ref() is None
+            ]
+        )
+
+    def begin_step(self) -> None:
+        self._prune_released_workspaces()
+        for state in self.states.values():
+            state.begin_step()
+
+    def clear(self) -> None:
+        self._retire(list(self.states))
+
+    def for_workspace(
+        self,
+        workspace: torch.Tensor,
+        layer_idx: int,
+        kv_cache: torch.Tensor,
+        workspace_pool: _CKVPrefetchWorkspacePool,
+    ) -> _CKVPrefetchState:
+        self._prune_released_workspaces()
+        self._bind_workspace_pool(workspace_pool)
+        identity = _ckv_workspace_identity(workspace)
+        state = self.states.get(identity)
+        if state is None:
+            stale_identities = [
+                existing
+                for existing, existing_state in self.states.items()
+                if (
+                    existing.device == identity.device
+                    and existing.data_ptr == identity.data_ptr
+                )
+                or (
+                    layer_idx < len(existing_state.layer_caches)
+                    and existing_state.layer_caches[layer_idx] is kv_cache
+                )
+            ]
+            self._retire(stale_identities)
+            assert self.workspace_pool is not None
+            state = _CKVPrefetchState(identity, workspace, self.workspace_pool)
+            self.states[identity] = state
+        return state
 
 
 def _dcp_all_gather_current_stream(
@@ -563,6 +853,7 @@ class B12xMLASparseMetadata(AttentionMetadata):
     dcp_local_total_tokens: int = 0
     dcp_padded_total_tokens: int = 0
     dcp_ckv_gather_eligible: bool = False
+    ckv_prefetch_registry: _CKVPrefetchStateRegistry | None = None
 
 
 class B12xMLASparseMetadataBuilder(
@@ -621,6 +912,9 @@ class B12xMLASparseMetadataBuilder(
             self.requires_glm_next_selector_metadata
             and self.dcp_world_size > 1
             and envs.VLLM_B12X_MLA_CKV_GATHER
+        )
+        self.ckv_prefetch_registry = (
+            _CKVPrefetchStateRegistry() if self._ckv_gather_requested else None
         )
         if self._ckv_gather_requested:
             hf_config = vllm_config.model_config.hf_text_config
@@ -755,6 +1049,8 @@ class B12xMLASparseMetadataBuilder(
         selector_num_accepted_tokens: torch.Tensor | None = None,
         selector_is_prefilling: torch.Tensor | None = None,
     ) -> B12xMLASparseMetadata:
+        if self.ckv_prefetch_registry is not None:
+            self.ckv_prefetch_registry.begin_step()
         metadata = super().build(
             common_prefix_len, common_attn_metadata, fast_build=fast_build
         )
@@ -767,6 +1063,7 @@ class B12xMLASparseMetadataBuilder(
             else common.seq_lens
         )
         metadata.seq_lens = seq_lens
+        metadata.ckv_prefetch_registry = self.ckv_prefetch_registry
 
         if common.max_query_len <= 1 and num_tokens == common.num_reqs:
             per_token_lens = seq_lens[:num_tokens]
@@ -966,6 +1263,12 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
     supports_dense_mha_prefill = False
     supports_pcp = False
 
+    @classmethod
+    def reset_kv_cache_binding_state(cls) -> None:
+        """Release cross-layer CKV state before a cache allocation is replaced."""
+        for registry in tuple(_CKV_PREFETCH_STATE_REGISTRIES):
+            registry.clear()
+
     def __init__(
         self,
         num_heads: int,
@@ -1099,6 +1402,63 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         self._module = module
         self._kernel_page_size = 0
         self._set_kernel_page_size(kernel_page_size)
+        configured_prefetch_depth = max(0, int(envs.VLLM_B12X_MLA_CKV_PREFETCH_DEPTH))
+        configured_workspace_mib = max(
+            0, int(envs.VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB)
+        )
+        workspace_budget_bytes = configured_workspace_mib * 1024 * 1024
+        requested_prefetch_depth = (
+            configured_prefetch_depth if self._ckv_gather_enabled else 0
+        )
+        self._ckv_prefetch_depth = _ckv_prefetch_depth_within_budget(
+            requested_prefetch_depth,
+            workspace_budget_bytes,
+            self.dcp_world_size,
+            self._ckv_local_capacity,
+            _GLM_NEXT_CACHE_RECORD_BYTES,
+        )
+        self._ckv_workspace_slots = _ckv_prefetch_ring_slots(self._ckv_prefetch_depth)
+        self._ckv_workspace_nbytes = (
+            _ckv_prefetch_workspace_nbytes(
+                self._ckv_prefetch_depth,
+                self.dcp_world_size,
+                self._ckv_local_capacity,
+                _GLM_NEXT_CACHE_RECORD_BYTES,
+            )
+            if self._ckv_gather_enabled and self._ckv_prefetch_depth > 0
+            else 0
+        )
+        execution_lanes = _ckv_prefetch_execution_lanes(
+            vllm_config.parallel_config.num_ubatches,
+            vllm_config.speculative_config is not None,
+        )
+        device = torch.device("cuda", torch.accelerator.current_device_index())
+        self._ckv_workspace_pool = (
+            _get_ckv_prefetch_workspace_pool(
+                device,
+                self._ckv_workspace_nbytes,
+                execution_lanes,
+            )
+            if self._ckv_workspace_nbytes > 0
+            else None
+        )
+        self._ckv_current_chunk_kv_c: torch.Tensor | None = None
+        if self._ckv_workspace_pool is not None:
+            logger.info_once(
+                "Using CKV layer prefetch depth=%d with %.1f MiB for %d "
+                "execution lane(s)",
+                self._ckv_prefetch_depth,
+                self._ckv_workspace_pool.storage.numel() / (1024 * 1024),
+                execution_lanes,
+            )
+        if self._ckv_prefetch_depth < requested_prefetch_depth:
+            logger.info_once(
+                "Capped CKV prefetch depth from %d to %d for the %d MiB "
+                "per-lane workspace budget",
+                requested_prefetch_depth,
+                self._ckv_prefetch_depth,
+                configured_workspace_mib,
+            )
         self.supports_quant_query_input = False
 
     def _set_kernel_page_size(self, kernel_page_size: int) -> None:
@@ -1221,6 +1581,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         attn_metadata: B12xMLASparseMetadata,
         local_buffer: torch.Tensor,
         gathered_buffer: torch.Tensor,
+        stream: torch.cuda.Stream | None = None,
     ) -> torch.Tensor:
         if not self.uses_full_ckv_dcp(attn_metadata, attn_metadata.num_actual_tokens):
             raise RuntimeError("full CKV gather called for an ineligible batch")
@@ -1247,23 +1608,128 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         assert attn_metadata.dcp_local_cu_seq_lens is not None
         local_tokens = attn_metadata.dcp_local_total_tokens
         padded_tokens = attn_metadata.dcp_padded_total_tokens
-        if local_tokens:
-            ops.cp_gather_cache(
-                src_cache=kv_cache,
-                dst=local_buffer[:local_tokens],
-                block_table=attn_metadata.block_table,
-                cu_seq_lens=attn_metadata.dcp_local_cu_seq_lens,
-                batch_size=attn_metadata.num_reqs,
+        if stream is not None:
+            local_buffer.record_stream(stream)
+            gathered_buffer.record_stream(stream)
+            stream.wait_stream(torch.cuda.current_stream())
+            stream_context = torch.cuda.stream(stream)
+        else:
+            stream_context = torch.cuda.stream(torch.cuda.current_stream())
+        with stream_context:
+            if local_tokens:
+                ops.cp_gather_cache(
+                    src_cache=kv_cache,
+                    dst=local_buffer[:local_tokens],
+                    block_table=attn_metadata.block_table,
+                    cu_seq_lens=attn_metadata.dcp_local_cu_seq_lens,
+                    batch_size=attn_metadata.num_reqs,
+                )
+            if local_tokens < padded_tokens:
+                local_buffer[local_tokens:padded_tokens].zero_()
+            if stream is None:
+                dcp_group = get_dcp_group()
+            else:
+                from vllm.distributed.parallel_state import (
+                    get_dcp_ckv_prefetch_group,
+                )
+
+                dcp_group = get_dcp_ckv_prefetch_group()
+            _dcp_all_gather_current_stream(
+                dcp_group,
+                local_buffer[:padded_tokens].view(-1),
+                gathered_buffer[: self.dcp_world_size * padded_tokens].view(-1),
             )
-        if local_tokens < padded_tokens:
-            local_buffer[local_tokens:padded_tokens].zero_()
-        _dcp_all_gather_current_stream(
-            get_dcp_group(),
-            local_buffer[:padded_tokens].view(-1),
-            gathered_buffer[: self.dcp_world_size * padded_tokens].view(-1),
-        )
         return gathered_buffer.view(
             -1, self._kernel_page_size, _GLM_NEXT_CACHE_RECORD_BYTES
+        )
+
+    def _ckv_workspace_views(
+        self,
+        workspace: torch.Tensor,
+        buf_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not 0 <= buf_idx < self._ckv_workspace_slots:
+            raise ValueError(f"CKV workspace slot out of range: {buf_idx}")
+        local_nbytes = self._ckv_local_capacity * _GLM_NEXT_CACHE_RECORD_BYTES
+        gathered_nbytes = self.dcp_world_size * local_nbytes
+        local_buffer = workspace.narrow(0, 0, local_nbytes).view(
+            self._ckv_local_capacity,
+            _GLM_NEXT_CACHE_RECORD_BYTES,
+        )
+        gathered_offset = local_nbytes + buf_idx * gathered_nbytes
+        gathered_buffer = workspace.narrow(0, gathered_offset, gathered_nbytes).view(
+            self.dcp_world_size * self._ckv_local_capacity,
+            _GLM_NEXT_CACHE_RECORD_BYTES,
+        )
+        return local_buffer, gathered_buffer
+
+    def set_ckv_current_chunk_kv(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+    ) -> None:
+        del k_pe
+        self._ckv_current_chunk_kv_c = kv_c_normed
+
+    @staticmethod
+    def _resolve_layer_index(layer: AttentionLayer) -> int | None:
+        layer_idx = getattr(layer, "layer_idx", None)
+        if layer_idx is not None:
+            try:
+                return int(layer_idx)
+            except (TypeError, ValueError):
+                return None
+        layer_name = getattr(layer, "layer_name", None)
+        if not layer_name:
+            return None
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        try:
+            return extract_layer_index(layer_name)
+        except (ValueError, AssertionError, IndexError):
+            return None
+
+    def _append_current_chunk_to_gathered(
+        self,
+        gathered_cache: torch.Tensor,
+        attn_metadata: B12xMLASparseMetadata,
+        num_tokens: int,
+    ) -> None:
+        if self._ckv_current_chunk_kv_c is None or num_tokens == 0:
+            return
+        assert self._concat_and_cache_glm_next_mla is not None
+        assert attn_metadata.global_cache_seq_lens_per_req is not None
+        assert attn_metadata.dcp_rank_req_starts is not None
+        req_ids = attn_metadata.req_id_per_token[:num_tokens].to(torch.int64)
+        global_seq_lens = attn_metadata.global_cache_seq_lens_per_req[
+            : attn_metadata.num_reqs
+        ]
+        seq_len_per_token = global_seq_lens[req_ids].to(torch.int32)
+        query_start_loc = attn_metadata.query_start_loc[
+            : attn_metadata.num_reqs + 1
+        ].to(torch.int32)
+        chunk_start = query_start_loc[:-1][req_ids]
+        chunk_len = (query_start_loc[1:] - query_start_loc[:-1])[req_ids]
+        token_idx = torch.arange(
+            num_tokens,
+            device=gathered_cache.device,
+            dtype=torch.int32,
+        )
+        global_pos = seq_len_per_token - chunk_len + (token_idx - chunk_start)
+        interleave = attn_metadata.cp_kv_cache_interleave_size
+        owner = ((global_pos // interleave) % self.dcp_world_size).to(torch.int64)
+        local_pos = (
+            global_pos // (self.dcp_world_size * interleave) * interleave
+            + global_pos % interleave
+        ).to(torch.int64)
+        rank_req_starts = attn_metadata.dcp_rank_req_starts
+        flat_idx = owner * attn_metadata.num_reqs + req_ids
+        rank_start = rank_req_starts.reshape(-1)[flat_idx].to(torch.int64)
+        slots = owner * attn_metadata.dcp_padded_total_tokens + rank_start + local_pos
+        self._concat_and_cache_glm_next_mla(
+            self._ckv_current_chunk_kv_c[:num_tokens],
+            gathered_cache,
+            slots,
         )
 
     def forward_mqa(
@@ -1273,7 +1739,6 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         attn_metadata: B12xMLASparseMetadata,
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        del layer
         cache_page_size = int(kv_c_and_k_pe_cache.shape[1])
         metadata_page_size = int(attn_metadata.block_size)
         if self._is_glm_next and (
@@ -1297,6 +1762,15 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             max_tokens=self._max_tokens,
         )
         use_ckv_gather = self.uses_full_ckv_dcp(attn_metadata, num_tokens)
+        layer_idx = self._resolve_layer_index(layer) if use_ckv_gather else None
+        prefetch_registry = attn_metadata.ckv_prefetch_registry
+        use_persistent_ckv = (
+            use_ckv_gather
+            and self._ckv_prefetch_depth > 0
+            and self._ckv_workspace_pool is not None
+            and prefetch_registry is not None
+            and layer_idx is not None
+        )
         if use_ckv_gather:
             assert self._ckv_extend_plan is not None
             plan = self._ckv_extend_plan
@@ -1327,7 +1801,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     torch.uint8,
                 ),
             )
-            if use_ckv_gather
+            if use_ckv_gather and not use_persistent_ckv
             else ()
         )
         workspaces = current_workspace_manager().get_simultaneous(
@@ -1359,14 +1833,94 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_tokens]
         kv_cache_for_run = kv_c_and_k_pe_cache
+        prefetch_state: _CKVPrefetchState | None = None
+        ckv_workspace: torch.Tensor | None = None
         if use_ckv_gather:
-            local_buffer, gathered_buffer = workspaces[scratch_end:]
-            kv_cache_for_run = self._gather_full_ckv(
-                kv_c_and_k_pe_cache,
-                attn_metadata,
-                local_buffer,
-                gathered_buffer,
-            )
+            if use_persistent_ckv:
+                assert layer_idx is not None
+                assert prefetch_registry is not None
+                assert self._ckv_workspace_pool is not None
+                prefetch_state = prefetch_registry.for_workspace(
+                    q_buffer,
+                    layer_idx,
+                    kv_c_and_k_pe_cache,
+                    self._ckv_workspace_pool,
+                )
+                prefetch_state.enter_layer(layer_idx)
+                prefetch_state.register_cache(layer_idx, kv_c_and_k_pe_cache)
+                ckv_workspace = prefetch_state.get_ckv_workspace(
+                    self._ckv_workspace_nbytes
+                )
+                pending = prefetch_state.pending_layers.pop(layer_idx, None)
+                if pending is not None:
+                    gather_event, current_buf_idx = pending
+                    gather_event.wait()
+                    _, gathered_buffer = self._ckv_workspace_views(
+                        ckv_workspace, current_buf_idx
+                    )
+                    kv_cache_for_run = gathered_buffer.view(
+                        -1,
+                        self._kernel_page_size,
+                        _GLM_NEXT_CACHE_RECORD_BYTES,
+                    )
+                    self._append_current_chunk_to_gathered(
+                        kv_cache_for_run,
+                        attn_metadata,
+                        num_tokens,
+                    )
+                else:
+                    prefetch_state.wait_for_pending_writes()
+                    current_buf_idx = layer_idx % self._ckv_workspace_slots
+                    local_buffer, gathered_buffer = self._ckv_workspace_views(
+                        ckv_workspace, current_buf_idx
+                    )
+                    kv_cache_for_run = self._gather_full_ckv(
+                        kv_c_and_k_pe_cache,
+                        attn_metadata,
+                        local_buffer,
+                        gathered_buffer,
+                    )
+            else:
+                local_buffer, gathered_buffer = workspaces[scratch_end:]
+                kv_cache_for_run = self._gather_full_ckv(
+                    kv_c_and_k_pe_cache,
+                    attn_metadata,
+                    local_buffer,
+                    gathered_buffer,
+                )
+
+            if prefetch_state is not None and ckv_workspace is not None:
+                assert layer_idx is not None
+                targets = _ckv_prefetch_target_indices(
+                    layer_idx,
+                    self._ckv_prefetch_depth,
+                    prefetch_state.layer_caches,
+                    prefetch_state.pending_layers,
+                )
+                prefetch_stream = (
+                    prefetch_state.get_gather_stream() if targets else None
+                )
+                for target_idx in targets:
+                    assert prefetch_stream is not None
+                    target_cache = prefetch_state.layer_caches[target_idx]
+                    assert target_cache is not None
+                    target_buf_idx = target_idx % self._ckv_workspace_slots
+                    target_local, target_gathered = self._ckv_workspace_views(
+                        ckv_workspace, target_buf_idx
+                    )
+                    self._gather_full_ckv(
+                        target_cache,
+                        attn_metadata,
+                        target_local,
+                        target_gathered,
+                        stream=prefetch_stream,
+                    )
+                    target_event = torch.cuda.Event(blocking=False)
+                    target_event.record(prefetch_stream)
+                    prefetch_state.pending_layers[target_idx] = (
+                        target_event,
+                        target_buf_idx,
+                    )
             assert attn_metadata.ckv_selected_indices is not None
             assert attn_metadata.ckv_active_counts is not None
             assert attn_metadata.dcp_rank_req_starts is not None
