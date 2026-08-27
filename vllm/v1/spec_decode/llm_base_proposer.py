@@ -1074,7 +1074,12 @@ class SpecDecodeBaseProposer:
             # feedback into the next draft step.
             architectures = self.draft_model_config.hf_config.architectures or []
             return bool(
-                {"DeepSeekMTPModel", "KimiK3MTPModel"}.intersection(architectures)
+                {
+                    "DeepSeekMTPModel",
+                    "DeepseekV32MTPModel",
+                    "Glm5NextMTPModel",
+                    "KimiK3MTPModel",
+                }.intersection(architectures)
             )
         return self.method not in ("mtp", "draft_model", "dflash")
 

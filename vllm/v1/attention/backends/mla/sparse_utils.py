@@ -166,6 +166,8 @@ def _convert_req_index_to_global_index_kernel(
     # shapes (compile-time where possible)
     max_num_blocks_per_req: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    BLOCK_STRIDE_ROWS: tl.constexpr,
+    NUM_TOPK_TOKENS: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
     HAS_PREFILL: tl.constexpr,
     COUNT_VALID: tl.constexpr,  # whether to count valid indices
@@ -197,16 +199,17 @@ def _convert_req_index_to_global_index_kernel(
 
     # Each program covers BLOCK_N consecutive columns
     indice_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
+    in_bounds = indice_id < NUM_TOPK_TOKENS
 
     # Load request id for this token (no mask: grid is exact)
     req = tl.load(req_id_ptr + token_id)
 
     # Load token indices for this tile
     ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
-    tok = tl.load(ti_ptr)  # int32
+    tok = tl.load(ti_ptr, mask=in_bounds, other=-1)  # int32
 
     # Only token == -1 should propagate as -1
-    is_invalid_tok = tok < 0
+    is_invalid_tok = (tok < 0) | ~in_bounds
     is_prefill = False
     if HAS_PREFILL:
         prefill_req_id = tl.load(prefill_request_id_ptr + token_id)
@@ -263,7 +266,7 @@ def _convert_req_index_to_global_index_kernel(
     else:
         # Store results in place (input column == output column).
         out_ptr_ij = out_ptr + token_id * out_stride0 + indice_id * out_stride1
-        tl.store(out_ptr_ij, out_val)
+        tl.store(out_ptr_ij, out_val, mask=in_bounds)
 
         # Accumulate the tile's valid count into the row total; a single tile's
         # reduction *is* the total.
@@ -289,12 +292,14 @@ def _remap_tiling(
     Returns:
         (single_tile, block_n, tiles_per_row, num_warps)
     """
-    single_tile = (
-        count_valid and triton.next_power_of_2(NUM_TOPK_TOKENS) == NUM_TOPK_TOKENS
+    assert NUM_TOPK_TOKENS > 0, "NUM_TOPK_TOKENS must be positive"
+    assert BLOCK_N > 0 and BLOCK_N & (BLOCK_N - 1) == 0, (
+        f"BLOCK_N ({BLOCK_N}) must be a positive power of two"
     )
+    single_tile = count_valid and NUM_TOPK_TOKENS & (NUM_TOPK_TOKENS - 1) == 0
     if single_tile:
         return True, NUM_TOPK_TOKENS, 1, 8
-    return False, BLOCK_N, NUM_TOPK_TOKENS // BLOCK_N, 4
+    return False, BLOCK_N, (NUM_TOPK_TOKENS + BLOCK_N - 1) // BLOCK_N, 4
 
 
 def triton_convert_req_index_to_global_index(
@@ -340,9 +345,6 @@ def triton_convert_req_index_to_global_index(
         "is allocated like token_indices, so a longer req_id writes out of bounds"
     )
     assert token_indices.shape[1] == NUM_TOPK_TOKENS
-    assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
-        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by BLOCK_N ({BLOCK_N})"
-    )
 
     if HAS_PREFILL_WORKSPACE:
         assert prefill_workspace_request_ids is not None
@@ -395,6 +397,8 @@ def triton_convert_req_index_to_global_index(
         # shapes / constexprs
         max_num_blocks_per_req,
         BLOCK_SIZE,
+        BLOCK_STRIDE_ROWS if BLOCK_STRIDE_ROWS is not None else BLOCK_SIZE,
+        NUM_TOPK_TOKENS,
         block_n,
         HAS_PREFILL_WORKSPACE,
         return_valid_counts,
@@ -458,7 +462,6 @@ def triton_filter_and_convert_dcp_index(
     assert block_table.dtype == torch.int32
     assert token_indices.dtype == torch.int32
     assert token_indices.shape[1] == NUM_TOPK_TOKENS
-    assert NUM_TOPK_TOKENS % BLOCK_N == 0
 
     if dcp_size == 1:
         assert out is None and valid_counts is None, (
@@ -538,6 +541,8 @@ def triton_filter_and_convert_dcp_index(
         None,
         max_num_blocks_per_req,
         BLOCK_SIZE,
+        BLOCK_STRIDE_ROWS if BLOCK_STRIDE_ROWS is not None else BLOCK_SIZE,
+        NUM_TOPK_TOKENS,
         block_n,
         False,  # HAS_PREFILL
         count_valid,

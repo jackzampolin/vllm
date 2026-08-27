@@ -78,6 +78,144 @@ def _mock_base_model_load(monkeypatch):
     )
 
 
+def test_glm5next_mtp_uses_collapsed_hidden_size() -> None:
+    draft_model_config = SimpleNamespace(
+        get_hidden_size=lambda: 4096,
+        get_vocab_size=lambda: 154880,
+        hf_config=SimpleNamespace(
+            model_type="glm5_next_mtp",
+            hc_mult=4,
+            mhc=True,
+        ),
+        uses_mrope=False,
+    )
+    speculative_config = SimpleNamespace(
+        method="mtp",
+        num_speculative_tokens=5,
+        draft_model_config=draft_model_config,
+        use_local_argmax_reduction=False,
+        draft_sample_method="greedy",
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=speculative_config,
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=2,
+            max_num_batched_tokens=8,
+        ),
+        model_config=SimpleNamespace(
+            max_model_len=1024,
+            dtype=torch.bfloat16,
+            use_fp64_gumbel=False,
+        ),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            data_parallel_rank=0,
+        ),
+    )
+
+    speculator = _TestSpeculator(vllm_config, torch.device("cpu"))
+
+    assert speculator.hidden_size == 4096
+    assert speculator.hidden_states.shape == (8, 4096)
+
+
+def test_mtp_speculator_rolls_back_qsa_anchor_around_lookahead() -> None:
+    lifecycle = _QSAIntervalLifecycle()
+    speculator = object.__new__(MTPSpeculator)
+    speculator.model = SimpleNamespace(model=lifecycle)
+    speculator.rollback_qsa_interval_starts = True
+    speculator.share_mtp_topk_indices = False
+
+    speculator.on_multi_step_decode_begin(num_reqs=3)
+    speculator.on_multi_step_decode_end(num_reqs=3)
+
+    assert lifecycle.calls == ["snapshot", "restore"]
+
+
+def test_propose_restores_mtp_state_when_draft_decode_raises(monkeypatch) -> None:
+    lifecycle = _QSAIntervalLifecycle()
+    speculator = object.__new__(MTPSpeculator)
+    speculator.model = SimpleNamespace(model=lifecycle)
+    speculator.rollback_qsa_interval_starts = True
+    speculator.share_mtp_topk_indices = True
+    speculator.num_speculative_steps = 2
+    speculator.max_model_len = 32
+    speculator.max_num_reqs = 1
+    speculator.hidden_states = torch.zeros(3, 2)
+    speculator.last_token_indices = torch.zeros(1, dtype=torch.int64)
+    speculator.current_draft_step = torch.tensor(0, dtype=torch.int64)
+    speculator.input_buffers = SimpleNamespace()
+    speculator.draft_tokens = torch.zeros((1, 2), dtype=torch.int64)
+    speculator.prefill_cudagraph_manager = object()
+    speculator.decode_cudagraph_manager = object()
+    speculator.dp_size = 1
+    speculator.dp_rank = 0
+    speculator.use_fused_multi_step_decode = False
+    speculator.mrope_positions = None
+    speculator._copy_request_inputs = Mock()
+    speculator._prepare_eplb_forward = Mock()
+    speculator._prefill = Mock()
+
+    def fail_decode(*args, **kwargs) -> None:
+        lifecycle.interval_start = 19
+        raise RuntimeError("draft decode failed")
+
+    speculator._multi_step_decode = fail_decode
+
+    monkeypatch.setattr(spec_module, "prepare_prefill_inputs", Mock())
+    monkeypatch.setattr(spec_module, "prepare_decode_inputs", Mock())
+    monkeypatch.setattr(
+        spec_module,
+        "get_uniform_decode_token_count",
+        lambda *args, **kwargs: 3,
+    )
+    monkeypatch.setattr(
+        spec_module,
+        "dispatch_cg_and_sync_dp",
+        lambda *args, **kwargs: (
+            SimpleNamespace(cg_mode=CUDAGraphMode.NONE, num_tokens=3),
+            None,
+        ),
+    )
+
+    input_batch = SimpleNamespace(
+        num_tokens=3,
+        num_tokens_after_padding=3,
+        num_reqs=1,
+        num_scheduled_tokens=torch.tensor([3]),
+        seq_lens_cpu_upper_bound=torch.tensor([5]),
+        idx_mapping=torch.tensor([0]),
+        has_prefill=False,
+        seq_lens=torch.tensor([5]),
+    )
+
+    with pytest.raises(RuntimeError, match="draft decode failed"):
+        speculator.propose(
+            input_batch=input_batch,
+            attn_metadata={},
+            slot_mappings={},
+            last_hidden_states=torch.zeros(3, 2),
+            aux_hidden_states=None,
+            num_sampled=torch.tensor([1]),
+            num_rejected=torch.tensor([0]),
+            last_sampled=torch.tensor([1]),
+            next_prefill_tokens=torch.tensor([0]),
+            temperature=torch.tensor([1.0]),
+            seeds=torch.tensor([0]),
+        )
+
+    assert lifecycle.interval_start == 7
+    assert not lifecycle.skip_topk
+    assert lifecycle.calls == [
+        "skip_topk=False",
+        "compact_topk",
+        "snapshot",
+        "skip_topk=True",
+        "restore",
+        "skip_topk=False",
+    ]
+
+
 def _make_speculator(
     monkeypatch,
     output: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
