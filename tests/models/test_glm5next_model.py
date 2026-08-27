@@ -252,7 +252,7 @@ def test_glm5next_kda_splits_mixed_decode_prefill_batch(monkeypatch) -> None:
     layer.gate_lower_bound = -5.0
     layer.A_log = torch.ones(1)
     layer.dt_bias = torch.ones(1)
-    layer._b12x_kda_binding = None
+    layer._b12x_kda_plan = None
     layer.conv1d = SimpleNamespace(
         weight=torch.ones(3, 1, 3),
         bias=torch.zeros(3),
@@ -500,11 +500,101 @@ def test_glm5next_b12x_kda_plan_reserves_null_state_zero(monkeypatch) -> None:
     assert captured_caps["null_state_index"] == 0
 
 
-def test_glm5next_b12x_kda_ordinary_decode_uses_direct_inputs() -> None:
-    captured: dict[str, object] = {}
-    binding = object()
+def test_glm5next_b12x_kda_binds_caller_scratch_per_run(monkeypatch) -> None:
+    scratch = torch.empty(32, dtype=torch.uint8)
+    bindings: list[dict[str, object]] = []
+    runs: list[object] = []
+
+    class FakePlan:
+        @staticmethod
+        def shapes_and_dtypes():
+            return (((32,), torch.uint8),)
 
     class FakeApi:
+        @staticmethod
+        def bind_kda(plan, **kwargs):
+            binding = {"plan": plan, **kwargs}
+            bindings.append(binding)
+            return binding
+
+        @staticmethod
+        def run_kda(binding, **kwargs):
+            runs.append(binding)
+
+    workspace = SimpleNamespace(get_simultaneous=lambda *specs: (scratch,))
+    monkeypatch.setattr(
+        kimi_gdn_linear_attn,
+        "current_workspace_manager",
+        lambda: workspace,
+    )
+
+    layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    layer._b12x_kda_api = FakeApi()
+    layer._b12x_kda_plan = FakePlan()
+    layer._b12x_kda_max_tokens = 4
+    layer._b12x_kda_max_seqs = 2
+    layer._b12x_kda_state_index_columns = 2
+    layer.local_num_heads = 1
+    layer.head_dim = 2
+    layer.gate_lower_bound = -5.0
+    layer.A_log = torch.ones(1)
+    layer.dt_bias = torch.ones(2)
+    layer.o_norm = SimpleNamespace(weight=torch.ones(2), eps=1e-6)
+    layer.kv_cache = (torch.empty(0), torch.zeros(3, 1, 2, 2))
+    layer._b12x_kda_mixed_qkv = torch.empty(4, 6)
+    layer._b12x_kda_raw_g = torch.empty(4, 1, 2)
+    layer._b12x_kda_raw_beta = torch.empty(4, 1)
+    layer._b12x_kda_z = torch.empty(4, 1, 2)
+    layer._b12x_kda_output = torch.zeros(4, 1, 2)
+    layer._b12x_kda_query_start_loc = torch.zeros(3, dtype=torch.int32)
+    layer._b12x_kda_num_accepted_tokens = torch.ones(2, dtype=torch.int32)
+    layer._b12x_kda_state_indices = torch.zeros(2, 2, dtype=torch.int32)
+    layer._b12x_kda_num_seqs = torch.zeros(1, dtype=torch.int32)
+    layer._b12x_kda_num_tokens = torch.zeros(1, dtype=torch.int32)
+
+    kwargs = dict(
+        mixed_qkv=torch.ones(1, 6),
+        raw_g=torch.ones(1, 1, 2),
+        raw_beta=torch.ones(1, 1),
+        z=torch.ones(1, 1, 2),
+        output=torch.empty(1, 1, 2),
+        state_indices=torch.tensor([[1]], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        num_accepted_tokens=None,
+        num_requests=1,
+    )
+    layer._run_b12x_kda_decode_post_conv(**kwargs)
+    layer._run_b12x_kda_decode_post_conv(**kwargs)
+
+    assert len(bindings) == 2
+    assert bindings[0] is not bindings[1]
+    assert bindings[0]["scratch"] is scratch
+    assert bindings[1]["scratch"] is scratch
+    assert len(runs) == 2
+    assert runs[0] is bindings[0]
+    assert runs[1] is bindings[1]
+
+
+def test_glm5next_b12x_kda_ordinary_decode_uses_direct_inputs(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+    scratch = torch.empty(32, dtype=torch.uint8)
+    binding = object()
+
+    class FakePlan:
+        @staticmethod
+        def shapes_and_dtypes():
+            return (((32,), torch.uint8),)
+
+    class FakeApi:
+        @staticmethod
+        def bind_kda(plan, **kwargs):
+            captured["plan"] = plan
+            captured["scratch"] = kwargs["scratch"]
+            return binding
+
         @staticmethod
         def run_kda_single_token(bound: object, **kwargs: object) -> None:
             captured["binding"] = bound
@@ -514,16 +604,37 @@ def test_glm5next_b12x_kda_ordinary_decode_uses_direct_inputs() -> None:
         def run_kda(*args: object, **kwargs: object) -> None:
             raise AssertionError("ordinary decode must not use packed KDA staging")
 
+    workspace = SimpleNamespace(get_simultaneous=lambda *specs: (scratch,))
+    monkeypatch.setattr(
+        kimi_gdn_linear_attn,
+        "current_workspace_manager",
+        lambda: workspace,
+    )
+
     layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
     torch.nn.Module.__init__(layer)
     layer._b12x_kda_api = FakeApi()
-    layer._b12x_kda_binding = binding
+    layer._b12x_kda_plan = FakePlan()
     layer._b12x_kda_max_tokens = 16
     layer._b12x_kda_max_seqs = 16
     layer._b12x_kda_state_index_columns = 6
-    layer.gate_lower_bound = -5.0
-    layer.o_norm = SimpleNamespace(eps=1e-6)
+    layer.local_num_heads = 1
     layer.head_dim = 128
+    layer.gate_lower_bound = -5.0
+    layer.A_log = torch.ones(1)
+    layer.dt_bias = torch.ones(128)
+    layer.o_norm = SimpleNamespace(weight=torch.ones(128), eps=1e-6)
+    layer.kv_cache = (torch.empty(0), torch.zeros(16, 1, 128, 128))
+    layer._b12x_kda_mixed_qkv = torch.empty(16, 384)
+    layer._b12x_kda_raw_g = torch.empty(16, 1, 128)
+    layer._b12x_kda_raw_beta = torch.empty(16, 1)
+    layer._b12x_kda_z = torch.empty(16, 1, 128)
+    layer._b12x_kda_output = torch.empty(16, 1, 128)
+    layer._b12x_kda_query_start_loc = torch.zeros(17, dtype=torch.int32)
+    layer._b12x_kda_num_accepted_tokens = torch.ones(16, dtype=torch.int32)
+    layer._b12x_kda_state_indices = torch.zeros(16, 6, dtype=torch.int32)
+    layer._b12x_kda_num_seqs = torch.zeros(1, dtype=torch.int32)
+    layer._b12x_kda_num_tokens = torch.zeros(1, dtype=torch.int32)
 
     mixed_qkv = torch.empty(3, 384)
     raw_g = torch.empty(3, 1, 128)
@@ -545,6 +656,8 @@ def test_glm5next_b12x_kda_ordinary_decode_uses_direct_inputs() -> None:
     )
 
     assert captured == {
+        "plan": layer._b12x_kda_plan,
+        "scratch": scratch,
         "binding": binding,
         "mixed_qkv": mixed_qkv,
         "raw_g": raw_g,
