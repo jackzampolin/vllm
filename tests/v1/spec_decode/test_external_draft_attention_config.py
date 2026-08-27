@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,65 @@ import pytest
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_speculator
 from vllm.v1.worker.gpu.spec_decode.dspark import utils as dspark_utils
+from vllm.v1.worker.gpu.spec_decode.eagle import utils as eagle_utils
+
+
+@dataclass
+class _ParallelConfig:
+    decode_context_parallel_size: int = 1
+    cp_kv_cache_interleave_size: int = 1
+    dcp_comm_backend: str = "ag_rs"
+    rank: int = 0
+
+
+@dataclass
+class _SpeculativeConfig:
+    method: str
+    draft_parallel_config: _ParallelConfig
+    draft_model_config: object
+    moe_backend: str | None = None
+    kv_cache_dtype: str | None = None
+    attention_backend: object | None = None
+
+
+@dataclass
+class _VllmConfig:
+    speculative_config: _SpeculativeConfig
+    parallel_config: _ParallelConfig
+    model_config: object
+    kernel_config: object
+    cache_config: object
+    attention_config: object
+
+
+def test_native_mtp_inherits_target_dcp_cache_geometry(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_DCP_SHARD_DRAFT", raising=False)
+    draft_model_config = object()
+    target = _VllmConfig(
+        speculative_config=_SpeculativeConfig(
+            method="mtp",
+            draft_parallel_config=_ParallelConfig(),
+            draft_model_config=draft_model_config,
+        ),
+        parallel_config=_ParallelConfig(
+            decode_context_parallel_size=4,
+            cp_kv_cache_interleave_size=4,
+            dcp_comm_backend="a2a",
+            rank=3,
+        ),
+        model_config=object(),
+        kernel_config=object(),
+        cache_config=object(),
+        attention_config=object(),
+    )
+
+    draft = eagle_utils._create_draft_vllm_config(target)
+
+    assert draft.model_config is draft_model_config
+    assert draft.parallel_config.decode_context_parallel_size == 4
+    assert draft.parallel_config.cp_kv_cache_interleave_size == 4
+    assert draft.parallel_config.dcp_comm_backend == "a2a"
+    assert draft.parallel_config.rank == 3
 
 
 def test_dspark_loader_uses_external_draft_parallel_geometry(monkeypatch) -> None:

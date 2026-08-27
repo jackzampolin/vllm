@@ -28,6 +28,10 @@ def _create_draft_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
             decode_context_parallel_size=(
                 vllm_config.parallel_config.decode_context_parallel_size
             ),
+            cp_kv_cache_interleave_size=(
+                vllm_config.parallel_config.cp_kv_cache_interleave_size
+            ),
+            dcp_comm_backend=vllm_config.parallel_config.dcp_comm_backend,
         )
 
     draft_vllm_config = replace(
