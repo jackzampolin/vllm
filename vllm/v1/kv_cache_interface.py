@@ -506,6 +506,11 @@ class MLAAttentionSpec(FullAttentionSpec):
                 # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
                 # head_size stays semantic (512); bytes are determined here.
                 return self.storage_block_size * 584
+            if self.model_version == "glm5_next":
+                # GLM-5.3 stores one 512-byte FP8 CKV latent plus four FP32
+                # scales per token. Its pooled C4 index state is carried in
+                # the padded page tail published by the B12X backend.
+                return self.block_size * 528
             # V3.2 main MLA: 656-byte custom layout (kv_lora_rank=512 +
             # qk_rope_head_dim=64, head_size=576). See flashmla_sparse.py.
             return self.block_size * 656
