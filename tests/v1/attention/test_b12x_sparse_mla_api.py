@@ -7,6 +7,10 @@ from typing import Any
 
 import pytest
 import torch
+from vllm.models.deepseek_v32.b12x import B12xDeepseekV32Indexer
+from vllm.v1.attention.backends.b12x import B12xPagedAttentionBackend
+from vllm.v1.attention.backends.mla.b12x_indexer import B12xIndexerBackend
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm.config import AttentionConfig, set_current_vllm_config
 from vllm.model_executor.layers.attention.mla_attention import (
@@ -22,12 +26,9 @@ from vllm.models.deepseek_v32.attention import (
     DeepseekV32Indexer,
     _select_sparse_components,
 )
-from vllm.models.deepseek_v32.b12x import B12xDeepseekV32Indexer
 from vllm.platforms.interface import DeviceCapability
-from vllm.v1.attention.backends.b12x import B12xPagedAttentionBackend
 from vllm.v1.attention.backends.mla import b12x_indexer as generic_b12x_indexer
 from vllm.v1.attention.backends.mla import b12x_mla_sparse
-from vllm.v1.attention.backends.mla.b12x_indexer import B12xIndexerBackend
 from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xGLM5NextMLASparseBackend,
     B12xGLM5NextMLASparseMetadataBuilder,
@@ -44,7 +45,6 @@ from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
 from vllm.v1.attention.backends.mla.sparse_utils import _remap_tiling
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
-from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.worker.utils import select_common_block_size
 
 
@@ -148,7 +148,6 @@ def test_b12x_glm5_next_cache_spec_and_layout(monkeypatch) -> None:
         head_size=512,
         dtype=torch.uint8,
         cache_dtype_str="fp8_ds_mla",
-        state_content_bytes=656,
     )
 
     unidentified = B12xMLASparseBackend.customize_spec(probe)
@@ -173,11 +172,11 @@ def test_b12x_glm5_next_cache_spec_and_layout(monkeypatch) -> None:
 
     assert invalid_reasons == []
     assert unidentified == probe
-    assert packed_by_glm_backend.state_content_bytes == 528
-    assert packed_by_glm_backend.page_size_padded == 64 * 528 + 16 * 128 * 2
+    assert packed_by_glm_backend.real_page_size_bytes == 64 * 528
+    assert packed_by_glm_backend.page_size_padded == 64 * (528 + 33)
     assert packed_by_glm_backend.model_version == "glm5_next"
-    assert packed.state_content_bytes == 528
-    assert packed.page_size_padded == 64 * 528 + 16 * 128 * 2
+    assert packed.real_page_size_bytes == 64 * 528
+    assert packed.page_size_padded == 64 * (528 + 33)
     assert packed.model_version == "glm5_next"
     assert packed_without_config_context == packed
     assert layouts == (KVCacheLayout.BLHNC,)

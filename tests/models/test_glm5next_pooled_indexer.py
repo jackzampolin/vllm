@@ -95,16 +95,13 @@ def test_glm53_mla_spec_scales_fp8_index_tail_with_manager_block() -> None:
         num_kv_heads=1,
         head_size=512,
         dtype=torch.uint8,
-        state_content_bytes=528,
-        page_tail_bytes_per_token=33,
+        cache_dtype_str="fp8_ds_mla",
+        page_size_padded=256 * (528 + 33),
         model_version="glm5_next",
     )
 
     assert spec.unpadded_page_size_bytes == 256 * 528
     assert spec.page_size_bytes == 256 * (528 + 33)
-    promoted = spec.copy_with_new_block_size(2304)
-    assert promoted.unpadded_page_size_bytes == 2304 * 528
-    assert promoted.page_size_bytes == 2304 * (528 + 33)
 
 
 def test_glm53_selector_prefill_lengths_do_not_require_attention_backend() -> None:

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 import torch.nn.functional as F
 from torch import nn
+from vllm.v1.attention.backends.mla.b12x_indexer import _merge_dcp_topk
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig
@@ -21,7 +22,6 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.models.deepseek_v4.nvidia.b12x_indexer import (
     B12xC4SparseIndexer,
 )
-from vllm.v1.attention.backends.mla.b12x_indexer import _merge_dcp_topk
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.b12x_mla_sparse import (

@@ -539,6 +539,17 @@ class B12xGLM5NextMLASparseBackend(B12xMLASparseBackend):
         return super().customize_spec(replace(spec, model_version="glm5_next"))
 
     @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        del num_kv_heads, head_size, cache_dtype_str
+        return (num_blocks, block_size, _GLM_NEXT_CACHE_RECORD_BYTES)
+
+    @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         # Keep the hybrid manager page intact so its FP8 pooled-index tail is
         # copied and recycled with the corresponding MLA page.

@@ -1410,6 +1410,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             else:
                 mqa_q = q[:num_mqa_tokens]
                 qrep_decode = False
+            full_ckv_dcp = self.impl.uses_full_ckv_dcp(
+                attn_metadata, num_mqa_tokens
+            )
             mqa_output_slice = output[:num_mqa_tokens]
 
             mqa_q_nope, mqa_q_pe = mqa_q.split(

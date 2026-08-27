@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
     from vllm.platforms.interface import DeviceCapability
     from vllm.v1.attention.backends.utils import KVCacheLayoutType
-    from vllm.v1.kv_cache_interface import KVCacheSpec, KVQuantMode
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec, KVQuantMode
 
 from vllm.v1.kv_cache_interface import get_kv_quant_mode
 
@@ -155,6 +155,11 @@ class AttentionBackend(ABC):
     def get_metadata_group_key(cls, attn_layer: Any) -> tuple[Any, ...]:
         """Return extra layer attributes that require separate metadata builders."""
         return ()
+
+    @classmethod
+    def customize_spec(cls, spec: "AttentionSpec") -> "AttentionSpec":
+        """Allow a backend to publish its physical KV-cache page contract."""
+        return spec
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
