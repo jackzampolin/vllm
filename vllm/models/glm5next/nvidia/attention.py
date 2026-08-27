@@ -20,8 +20,6 @@ from vllm.model_executor.models.deepseek_v2 import (
     yarn_get_mscale,
 )
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
 from .pooled_indexer import Glm5NextPooledIndexer
 
 
@@ -29,9 +27,11 @@ def _select_sparse_backend(
     vllm_config: VllmConfig,
     attn_backend: type | None,
 ) -> type | None:
+    configured_backend = vllm_config.attention_config.backend
+    configured_backend_name = getattr(configured_backend, "name", str(configured_backend))
     if (
         attn_backend is None
-        and vllm_config.attention_config.backend == AttentionBackendEnum.B12X
+        and configured_backend_name in ("B12X", "B12X_MLA_SPARSE")
     ):
         from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
             B12xGLM5NextMLASparseBackend,
