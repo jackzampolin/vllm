@@ -125,6 +125,17 @@ class ModelState(ABC):
     ) -> None:
         return None
 
+    def prepare_draft_attn_metadata(
+        self,
+        *,
+        idx_mapping: torch.Tensor,
+        num_reqs: int,
+        num_reqs_padded: int,
+        draft_index: int,
+    ) -> ModelSpecificAttnMetadata | None:
+        """Build model-specific metadata for an autoregressive draft step."""
+        return None
+
     @abstractmethod
     def get_mm_embeddings(
         self,

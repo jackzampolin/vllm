@@ -601,14 +601,21 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
     kv_cache_dtype: CacheDType,
 ) -> CacheDType:
     backend_name = attn_backend.get_name()
-    if backend_name == "B12X_MLA_SPARSE" and kv_cache_dtype == "nvfp4_ds_mla":
+    if backend_name in ("B12X", "B12X_MLA_SPARSE") and kv_cache_dtype == (
+        "nvfp4_ds_mla"
+    ):
         # B12X reads the packed 432B NVFP4 MLA record natively; do NOT coerce
         # it to fp8_ds_mla. [nvfp4_reader_port]
         return "nvfp4_ds_mla"
-    if backend_name in (
-        "FLASHMLA_SPARSE",
-        "B12X_MLA_SPARSE",
-    ) and is_quantized_kv_cache(kv_cache_dtype):
+    if backend_name in ("B12X", "B12X_MLA_SPARSE") and kv_cache_dtype in (
+        "auto",
+        "fp8",
+        "fp8_e4m3",
+    ):
+        return "fp8_ds_mla"
+    if backend_name in ("FLASHMLA_SPARSE", "B12X_MLA_SPARSE") and (
+        is_quantized_kv_cache(kv_cache_dtype)
+    ):
         # NOTE: nvfp4_ds_mla deliberately falls through to fp8_ds_mla for
         # FLASHMLA_SPARSE (no NVFP4 reader there).
         return "fp8_ds_mla"

@@ -285,16 +285,6 @@ class DraftModelSpeculator(BaseSpeculator):
         max_seq_len_upper_bound: int | None = None,
         query_start_loc_np: np.ndarray | None = None,
     ) -> dict[str, Any] | None:
-        if dcp_local_seq_lens is None and getattr(self.block_tables, "cp_size", 1) > 1:
-            prepare_dcp_local_seq_lens(
-                self.input_buffers.dcp_local_seq_lens,
-                self.input_buffers.seq_lens,
-                num_reqs,
-                self.block_tables.cp_size,
-                self.block_tables.cp_rank,
-                self.block_tables.cp_interleave,
-            )
-            dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens
         if query_start_loc_np is not None:
             # Non-uniform query layout (e.g. multi-module MTP's mixed
             # prefill/decode queries); num_query_per_req is ignored.
@@ -349,6 +339,12 @@ class DraftModelSpeculator(BaseSpeculator):
                 self.block_tables.cp_interleave,
             )
             dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[:num_reqs_padded]
+        model_specific_attn_metadata = self.model_state.prepare_draft_attn_metadata(
+            idx_mapping=self.idx_mapping,
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded,
+            draft_index=step,
+        )
         with record_function_or_nullcontext("vllm:v2/speculator/build_attn_metadata"):
             attn_metadata = build_attn_metadata(
                 attn_groups=self.attn_groups,
@@ -368,6 +364,7 @@ class DraftModelSpeculator(BaseSpeculator):
                 dcp_local_seq_lens=dcp_local_seq_lens,
                 seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
                 max_seq_len_upper_bound=max_seq_len_upper_bound,
+                model_specific_attn_metadata=model_specific_attn_metadata,
             )
         return attn_metadata
 

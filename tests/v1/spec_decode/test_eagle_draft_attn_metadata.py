@@ -54,6 +54,8 @@ def _make_fake_speculator(
         kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
         max_model_len=max_model_len,
         draft_max_seq_len=draft_max_seq_len,
+        idx_mapping=torch.arange(max_num_reqs, dtype=torch.int32),
+        model_state=SimpleNamespace(prepare_draft_attn_metadata=lambda **_: None),
     )
 
 
