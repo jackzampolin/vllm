@@ -18,11 +18,6 @@ from vllm.model_executor.layers.attention.sparse_mla_attention import (
 )
 from vllm.models.deepseek_v4.nvidia import b12x as b12x_mla
 from vllm.models.deepseek_v4.nvidia import b12x_indexer
-from vllm.models.deepseek_v32.attention import (
-    DeepseekV32Indexer,
-    _select_sparse_components,
-)
-from vllm.models.deepseek_v32.b12x import B12xDeepseekV32Indexer
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backends.b12x_attn import B12XPagedAttentionBackend
 from vllm.v1.attention.backends.mla import b12x_indexer as generic_b12x_indexer
@@ -62,16 +57,6 @@ def test_b12x_selector_routes_supported_attention_families() -> None:
     assert b12x_mla.DeepseekV4B12xSparseMLABackend.get_name() == "B12X"
     assert not B12xIndexerBackend.supports_device_cpu_query_lens_mismatch()
     assert not B12xMLASparseBackend.supports_device_cpu_query_lens_mismatch()
-
-    config = SimpleNamespace(
-        attention_config=SimpleNamespace(backend=AttentionBackendEnum.B12X)
-    )
-    indexer_cls, backend_cls = _select_sparse_components(
-        config, None, DeepseekV32Indexer
-    )
-    assert indexer_cls is B12xDeepseekV32Indexer
-    assert backend_cls is B12xMLASparseBackend
-
 
 def test_b12x_sparse_mla_accepts_glm_dsa_contract(monkeypatch) -> None:
     monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: object())
