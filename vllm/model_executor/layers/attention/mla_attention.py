@@ -1512,7 +1512,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             use_ag_rs_fallback = False
             project_before_merge = False
             workspace_gather_used = False
-            ckv_gather_used = False
+            ckv_gather_used = full_ckv_dcp
             if self.impl.dcp_world_size > 1:
                 assert self.dcp_manager is not None
                 ckv_gather_selector = getattr(
