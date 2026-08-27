@@ -36,6 +36,7 @@ from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xMLASparseMetadata,
     B12xMLASparseMetadataBuilder,
     _selected_index_block_stride_rows,
+    _use_b12x_sparse_decode_plan,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import _remap_tiling
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -254,6 +255,37 @@ def test_b12x_glm5_next_accepts_dcp_with_speculation(monkeypatch) -> None:
         )
 
     assert invalid_reasons == []
+
+
+@pytest.mark.parametrize(
+    ("max_query_len", "is_spec_decode", "force", "expected"),
+    [
+        (1, False, False, True),
+        (6, True, False, True),
+        (6, False, False, False),
+        (6, False, True, True),
+        (9, True, False, False),
+    ],
+)
+def test_b12x_sparse_routes_only_verifier_extends_to_decode(
+    max_query_len: int,
+    is_spec_decode: bool,
+    force: bool,
+    expected: bool,
+) -> None:
+    assert (
+        _use_b12x_sparse_decode_plan(
+            max_query_len=max_query_len,
+            num_tokens=max_query_len * 4,
+            num_reqs=4,
+            is_spec_decode=is_spec_decode,
+            spec_extend_as_decode=True,
+            spec_extend_as_decode_force=force,
+            spec_decode_max_q=8,
+            max_tokens=4096,
+        )
+        is expected
+    )
 
 
 def test_b12x_glm5_next_accepts_dcp_with_prefix_caching(monkeypatch) -> None:
