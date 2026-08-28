@@ -500,6 +500,64 @@ def test_glm5next_b12x_kda_plan_reserves_null_state_zero(monkeypatch) -> None:
     assert captured_caps["null_state_index"] == 0
 
 
+def test_glm5next_b12x_kda_ordinary_decode_uses_direct_inputs() -> None:
+    captured: dict[str, object] = {}
+    binding = object()
+
+    class FakeApi:
+        @staticmethod
+        def run_kda_single_token(bound: object, **kwargs: object) -> None:
+            captured["binding"] = bound
+            captured.update(kwargs)
+
+        @staticmethod
+        def run_kda(*args: object, **kwargs: object) -> None:
+            raise AssertionError("ordinary decode must not use packed KDA staging")
+
+    layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    layer._b12x_kda_api = FakeApi()
+    layer._b12x_kda_binding = binding
+    layer._b12x_kda_max_tokens = 16
+    layer._b12x_kda_max_seqs = 16
+    layer._b12x_kda_state_index_columns = 6
+    layer.gate_lower_bound = -5.0
+    layer.o_norm = SimpleNamespace(eps=1e-6)
+    layer.head_dim = 128
+
+    mixed_qkv = torch.empty(3, 384)
+    raw_g = torch.empty(3, 1, 128)
+    raw_beta = torch.empty(3, 1)
+    z = torch.empty(3, 1, 128)
+    output = torch.empty(3, 1, 128)
+    state_indices = torch.tensor([[1], [4], [7]], dtype=torch.int32)
+
+    layer._run_b12x_kda_decode_post_conv(
+        mixed_qkv=mixed_qkv,
+        raw_g=raw_g,
+        raw_beta=raw_beta,
+        z=z,
+        output=output,
+        state_indices=state_indices,
+        query_start_loc=torch.arange(4, dtype=torch.int32),
+        num_accepted_tokens=None,
+        num_requests=3,
+    )
+
+    assert captured == {
+        "binding": binding,
+        "mixed_qkv": mixed_qkv,
+        "raw_g": raw_g,
+        "raw_beta": raw_beta,
+        "z": z,
+        "state_indices": state_indices,
+        "output": output,
+        "lower_bound": -5.0,
+        "eps": 1e-6,
+        "scale": 128**-0.5,
+    }
+
+
 def test_glm5next_sparse_mla_selects_b12x_backend(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
