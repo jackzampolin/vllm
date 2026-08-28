@@ -353,7 +353,17 @@ def _select_mqa_query(
     num_mqa_tokens: int,
     full_ckv_dcp: bool,
 ) -> tuple[torch.Tensor, bool]:
-    """Select local or replicated query geometry for MLA decode/prefill."""
+    """Select local or replicated query geometry for MLA decode/prefill.
+
+    Args:
+        q: Query tensor in local DCP geometry.
+        q_dcp_replicated: Query tensor replicated across the DCP group, if built.
+        num_mqa_tokens: Number of MQA query rows required by the backend.
+        full_ckv_dcp: Whether the backend attends a globally gathered CKV cache.
+
+    Returns:
+        The selected query tensor and whether replicated geometry was selected.
+    """
     if q_dcp_replicated is not None and not full_ckv_dcp:
         return q_dcp_replicated[:num_mqa_tokens], True
     return q[:num_mqa_tokens], False
@@ -1027,7 +1037,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 ckv_setter = getattr(self.impl, "set_ckv_current_chunk_kv", None)
                 if callable(ckv_setter):
                     ckv_setter(k_c_normed, k_pe)
-            attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)  # type: ignore[attr-defined]
+            attn_out, lse = self.impl.forward_mqa(
+                mqa_q, kv_cache, attn_metadata, self
+            )  # type: ignore[attr-defined]
 
             # correct dcp attn_out with lse.
             if self.impl.dcp_world_size > 1 and not full_ckv_dcp:

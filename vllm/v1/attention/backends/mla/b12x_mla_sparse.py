@@ -1265,7 +1265,12 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
 
     @classmethod
     def reset_kv_cache_binding_state(cls) -> None:
-        """Release cross-layer CKV state before a cache allocation is replaced."""
+        """Release class-wide CKV state before a cache allocation is replaced.
+
+        This hook resets shared binding registries for every instance of this
+        implementation class. The worker therefore invokes it once per concrete
+        implementation type during cache unbinding.
+        """
         for registry in tuple(_CKV_PREFETCH_STATE_REGISTRIES):
             registry.clear()
 
@@ -1774,9 +1779,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         if use_ckv_gather:
             assert self._ckv_extend_plan is not None
             plan = self._ckv_extend_plan
-            logger.info_once(
-                "Using transient full-CKV gather for GLM5Next B12X DCP prefill"
-            )
+            logger.info_once("Using full-CKV gather for GLM5Next B12X DCP prefill")
         else:
             plan = self._decode_plan if use_decode else self._extend_plan
             if use_decode and attn_metadata.max_query_len > 1:

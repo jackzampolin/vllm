@@ -1412,6 +1412,14 @@ _DCP_CKV_PREFETCH: GroupCoordinator | None = None
 
 
 def get_dcp_ckv_prefetch_group() -> GroupCoordinator:
+    """Return the process group used to prefetch CKV across DCP ranks.
+
+    Returns:
+        The initialized DCP CKV prefetch group coordinator.
+
+    Raises:
+        AssertionError: If the DCP CKV prefetch group is not initialized.
+    """
     assert _DCP_CKV_PREFETCH is not None, "DCP CKV prefetch group is not initialized"
     return _DCP_CKV_PREFETCH
 
