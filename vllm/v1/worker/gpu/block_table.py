@@ -351,17 +351,13 @@ def _compute_slot_mappings_kernel(
             rounds = virtual_block_offsets // (CP_INTERLEAVE * CP_SIZE)
             remainder = virtual_block_offsets % CP_INTERLEAVE
             local_offsets = rounds * CP_INTERLEAVE + remainder
-            sharded_positions = (
-                virtual_block_indices * kv_block_size + local_offsets
-            )
+            sharded_positions = virtual_block_indices * kv_block_size + local_offsets
             # Replicated draft groups store every token locally. Express the
             # runtime group choice with vector selects so Triton sees the same
             # types on both paths during kernel compilation.
             is_replicated = group_cp_size == 1
             is_local = token_mask & (is_replicated | sharded_is_local)
-            local_positions = tl.where(
-                is_replicated, positions, sharded_positions
-            )
+            local_positions = tl.where(is_replicated, positions, sharded_positions)
 
         block_indices = local_positions // kernel_block_size
         block_offsets = local_positions % kernel_block_size

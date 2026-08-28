@@ -418,9 +418,7 @@ class Scheduler(SchedulerInterface):
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
         last_cache_position = request.num_tokens - request.num_tokens % block_size
-        if self.use_eagle and not getattr(
-            self, "mamba_has_sliding_eagle_group", False
-        ):
+        if self.use_eagle and not getattr(self, "mamba_has_sliding_eagle_group", False):
             last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens

@@ -1037,9 +1037,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 ckv_setter = getattr(self.impl, "set_ckv_current_chunk_kv", None)
                 if callable(ckv_setter):
                     ckv_setter(k_c_normed, k_pe)
-            attn_out, lse = self.impl.forward_mqa(
-                mqa_q, kv_cache, attn_metadata, self
-            )  # type: ignore[attr-defined]
+            attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)  # type: ignore[attr-defined]
 
             # correct dcp attn_out with lse.
             if self.impl.dcp_world_size > 1 and not full_ckv_dcp:

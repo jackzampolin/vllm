@@ -105,11 +105,14 @@ def test_dflash_keeps_final_mamba_cache_boundary() -> None:
     """DFlash drops its group-local draft block, not the target Mamba state."""
     (request,) = create_requests(1, num_tokens=10355, block_size=ATTN_BLOCK_SIZE)
     request.num_computed_tokens = 5 * MAMBA_BLOCK_SIZE
-    assert _split(
-        request,
-        request.num_tokens - request.num_computed_tokens,
-        has_sliding_eagle_group=True,
-    ) == MAMBA_BLOCK_SIZE
+    assert (
+        _split(
+            request,
+            request.num_tokens - request.num_computed_tokens,
+            has_sliding_eagle_group=True,
+        )
+        == MAMBA_BLOCK_SIZE
+    )
 
 
 @pytest.mark.parametrize(

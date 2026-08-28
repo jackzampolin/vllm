@@ -2274,9 +2274,7 @@ def test_group_dcp_replicated_dflash_draft():
 
     groups = get_kv_cache_groups(_grouping_config(), specs)
     draft_group = next(
-        group
-        for group in groups
-        if isinstance(group.kv_cache_spec, SlidingWindowSpec)
+        group for group in groups if isinstance(group.kv_cache_spec, SlidingWindowSpec)
     )
     assert all(group.kv_cache_spec.block_size == 16 for group in groups)
     assert draft_group.kv_cache_spec.dcp_replicated is True

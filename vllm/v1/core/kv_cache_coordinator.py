@@ -624,9 +624,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             # groups may instead replicate their cache and execute locally.
             for g in kv_cache_config.kv_cache_groups:
                 spec = g.kv_cache_spec
-                assert (
-                    isinstance(spec, (FullAttentionSpec, MambaSpec))
-                    or getattr(spec, "dcp_replicated", False)
+                assert isinstance(spec, (FullAttentionSpec, MambaSpec)) or getattr(
+                    spec, "dcp_replicated", False
                 ), (
                     "DCP with hybrid KV cache layouts only supports "
                     "full-attention, Mamba, and replicated draft groups, got: "

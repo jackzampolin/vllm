@@ -180,9 +180,7 @@ class DFlashAttention(Attention):
     """Attention whose small draft KV is replicated across DCP ranks."""
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
-        dcp_replicated = (
-            vllm_config.parallel_config.decode_context_parallel_size > 1
-        )
+        dcp_replicated = vllm_config.parallel_config.decode_context_parallel_size > 1
         if self.sliding_window is not None:
             assert self.attn_type == AttentionType.DECODER
             return SlidingWindowSpec(

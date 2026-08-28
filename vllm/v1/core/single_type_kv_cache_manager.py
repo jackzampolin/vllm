@@ -78,9 +78,7 @@ class SingleTypeKVCacheManager(ABC):
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
-        if dcp_world_size > 1 and not getattr(
-            kv_cache_spec, "dcp_replicated", False
-        ):
+        if dcp_world_size > 1 and not getattr(kv_cache_spec, "dcp_replicated", False):
             self.block_size *= dcp_world_size
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
@@ -705,9 +703,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             "and chunked local attention groups"
         )
         block_size = kv_cache_spec.block_size
-        if dcp_world_size > 1 and not getattr(
-            kv_cache_spec, "dcp_replicated", False
-        ):
+        if dcp_world_size > 1 and not getattr(kv_cache_spec, "dcp_replicated", False):
             # DCP shards each block's KV across ranks; hashes must be viewed at
             # the sharded block size.
             block_size *= dcp_world_size
