@@ -37,6 +37,7 @@ from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
 )
 from vllm.model_executor.layers.fused_moe.oracle import nvfp4 as nvfp4_oracle
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Dynamic
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
@@ -129,6 +130,31 @@ def test_nvfp4_clamp_allows_shared_activation_backends(
     )
 
     assert selected == expected
+
+
+def test_nvfp4_clamp_allows_b12x_force_a16(monkeypatch):
+    class SupportedExperts:
+        @staticmethod
+        def is_supported_config(*args, **kwargs):
+            return True, None
+
+    monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
+    monkeypatch.setattr(
+        nvfp4_oracle, "backend_to_kernel_cls", lambda backend: [SupportedExperts]
+    )
+    moe_config = make_dummy_moe_config()
+    moe_config.moe_backend = "b12x"
+    moe_config.swiglu_limit = 7.0
+
+    selected, _ = nvfp4_oracle.select_nvfp4_moe_backend(
+        moe_config,
+        weight_key=None,
+        # A serialized NVFP4 checkpoint normally has an activation key;
+        # force-A16 must still make B12X clamp-capable at oracle time.
+        activation_key=kNvfp4Dynamic,
+    )
+
+    assert selected == nvfp4_oracle.NvFp4MoeBackend.B12X
 
 
 @dataclasses.dataclass

@@ -220,7 +220,8 @@ def select_nvfp4_moe_backend(
         if backend in NVFP4_BACKENDS_WITH_CLAMP:
             return True
         return backend == NvFp4MoeBackend.B12X and (
-            activation_key is None
+            _env_flag("B12X_MOE_FORCE_A16")
+            or activation_key is None
             or config.activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE
         )
 
