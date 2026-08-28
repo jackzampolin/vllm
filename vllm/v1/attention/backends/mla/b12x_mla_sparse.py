@@ -1469,7 +1469,55 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 self._ckv_prefetch_depth,
                 configured_workspace_mib,
             )
+        self._pretouch_attention_workspace()
         self.supports_quant_query_input = False
+
+    def _pretouch_attention_workspace(self) -> None:
+        """Reserve the largest planned attention scratch before KV profiling."""
+        candidates = [
+            (
+                (
+                    (self._max_tokens, self._input_num_heads, self._q_head_dim),
+                    torch.bfloat16,
+                ),
+                *self._decode_plan.shapes_and_dtypes(),
+            ),
+            (
+                (
+                    (self._max_tokens, self._input_num_heads, self._q_head_dim),
+                    torch.bfloat16,
+                ),
+                *self._extend_plan.shapes_and_dtypes(),
+            ),
+        ]
+        if self._ckv_extend_plan is not None:
+            candidates.append(
+                (
+                    (
+                        (self._max_tokens, self.num_heads, self._q_head_dim),
+                        torch.bfloat16,
+                    ),
+                    *self._ckv_extend_plan.shapes_and_dtypes(),
+                )
+            )
+
+        def workspace_bytes(specs: tuple[tuple[tuple[int, ...], torch.dtype], ...]):
+            total = 0
+            for shape, dtype in specs:
+                numel = 1
+                for dim in shape:
+                    numel *= int(dim)
+                nbytes = numel * torch.empty((), dtype=dtype).element_size()
+                total += (nbytes + 255) // 256 * 256
+            return total
+
+        largest = max(candidates, key=workspace_bytes)
+        reserved_bytes = workspace_bytes(largest)
+        current_workspace_manager().get_simultaneous(*largest)
+        logger.info_once(
+            "Preallocated %.1f MiB of B12X sparse MLA scratch before KV profiling",
+            reserved_bytes / (1024 * 1024),
+        )
 
     def _set_kernel_page_size(self, kernel_page_size: int) -> None:
         if kernel_page_size <= 0 or kernel_page_size % 64:
