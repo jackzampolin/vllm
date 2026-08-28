@@ -102,6 +102,43 @@ class _QSAIntervalLifecycle:
         self.calls.append("compact_topk")
 
 
+@pytest.mark.parametrize(
+    ("piecewise_prefill", "expected_prefill_mode"),
+    [
+        (False, CUDAGraphMode.FULL_AND_PIECEWISE),
+        (True, CUDAGraphMode.PIECEWISE),
+    ],
+)
+def test_autoregressive_speculator_can_limit_draft_prefill_to_piecewise_graphs(
+    monkeypatch,
+    piecewise_prefill: bool,
+    expected_prefill_mode: CUDAGraphMode,
+) -> None:
+    manager_modes: list[CUDAGraphMode] = []
+
+    def make_manager(_config, _device, mode, *args, **kwargs):
+        manager_modes.append(mode)
+        return SimpleNamespace()
+
+    monkeypatch.setenv(
+        "VLLM_SPECULATOR_PREFILL_PIECEWISE",
+        "1" if piecewise_prefill else "0",
+    )
+    monkeypatch.setattr(spec_module, "SpeculatorCudaGraphManager", make_manager)
+
+    speculator = object.__new__(_TestSpeculator)
+    speculator.vllm_config = SimpleNamespace()
+    speculator.device = torch.device("cpu")
+    speculator.num_speculative_steps = 5
+
+    speculator.init_cudagraph_manager(CUDAGraphMode.FULL_AND_PIECEWISE)
+
+    assert manager_modes == [
+        expected_prefill_mode,
+        CUDAGraphMode.FULL_DECODE_ONLY,
+    ]
+
+
 def _mock_base_model_load(monkeypatch):
     monkeypatch.setattr(
         base_spec_module,
