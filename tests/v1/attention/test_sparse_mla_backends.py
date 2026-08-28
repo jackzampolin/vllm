@@ -1473,6 +1473,37 @@ def test_triton_convert_req_index_to_global_index_decode_only(
     torch.testing.assert_close(result, reference_result, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() < (9, 0),
+    reason="FlashMLASparseBackend requires CUDA 9.0 or higher",
+)
+def test_triton_convert_req_index_uses_physical_block_stride():
+    device = torch.device(DEVICE_TYPE)
+    block_size = 16
+    block_stride_rows = 64
+    num_topk_tokens = 128
+    req_id = torch.tensor([0], dtype=torch.int32, device=device)
+    block_table = torch.tensor([[3, 5]], dtype=torch.int32, device=device)
+    token_indices = torch.full(
+        (1, num_topk_tokens), -1, dtype=torch.int32, device=device
+    )
+    token_indices[0, :4] = torch.tensor(
+        [0, 15, 16, 17], dtype=torch.int32, device=device
+    )
+
+    result = triton_convert_req_index_to_global_index(
+        req_id,
+        block_table,
+        token_indices,
+        BLOCK_SIZE=block_size,
+        BLOCK_STRIDE_ROWS=block_stride_rows,
+        NUM_TOPK_TOKENS=num_topk_tokens,
+    )
+
+    assert result[0, :4].tolist() == [192, 207, 320, 321]
+    assert torch.all(result[0, 4:] == -1)
+
+
 @pytest.mark.parametrize("block_size", [16])
 @pytest.mark.skipif(
     torch.cuda.get_device_capability() < (9, 0),

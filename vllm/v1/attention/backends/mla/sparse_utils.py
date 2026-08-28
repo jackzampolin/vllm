@@ -235,7 +235,7 @@ def _convert_req_index_to_global_index_kernel(
     bt_ptr = block_table_ptr + req * bt_stride0 + block_id * bt_stride1
     is_invalid_tok |= ~valid_block | is_remote
     base = tl.load(bt_ptr, mask=valid_block & ~is_prefill & ~is_remote, other=0)
-    out_val = base * BLOCK_SIZE + inblock_off
+    out_val = base * BLOCK_STRIDE_ROWS + inblock_off
 
     # Override with prefill output if prefill is enabled
     if HAS_PREFILL:
@@ -307,6 +307,7 @@ def triton_convert_req_index_to_global_index(
     block_table: torch.Tensor,  # int32 [num_requests, max_num_blocks_per_req]
     token_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
     BLOCK_SIZE: int = 64,
+    BLOCK_STRIDE_ROWS: int | None = None,
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 128,  # tile width along columns
     HAS_PREFILL_WORKSPACE: bool = False,
@@ -432,6 +433,7 @@ def triton_filter_and_convert_dcp_index(
     dcp_rank: int,
     cp_kv_cache_interleave_size: int = 1,
     BLOCK_SIZE: int = 64,
+    BLOCK_STRIDE_ROWS: int | None = None,
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 128,
     return_valid_counts: bool = False,
@@ -472,6 +474,7 @@ def triton_filter_and_convert_dcp_index(
             block_table,
             token_indices,
             BLOCK_SIZE=BLOCK_SIZE,
+            BLOCK_STRIDE_ROWS=BLOCK_STRIDE_ROWS,
             NUM_TOPK_TOKENS=NUM_TOPK_TOKENS,
             BLOCK_N=BLOCK_N,
             return_valid_counts=return_valid_counts,
