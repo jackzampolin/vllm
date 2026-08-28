@@ -336,20 +336,32 @@ def _compute_slot_mappings_kernel(
         token_mask = offset < end_idx
         positions = tl.load(pos + offset, mask=token_mask, other=0)
 
-        if CP_SIZE == 1 or group_cp_size == 1:
+        if CP_SIZE == 1:
             # Common case: Context parallelism is not used.
             local_positions = positions
-            is_local = True
+            is_local = token_mask
         else:
             # Context parallelism is used.
             virtual_block_size = kv_block_size * CP_SIZE
             virtual_block_indices = positions // virtual_block_size
             virtual_block_offsets = positions % virtual_block_size
-            is_local = virtual_block_offsets // CP_INTERLEAVE % CP_SIZE == cp_rank
+            sharded_is_local = (
+                virtual_block_offsets // CP_INTERLEAVE % CP_SIZE == cp_rank
+            )
             rounds = virtual_block_offsets // (CP_INTERLEAVE * CP_SIZE)
             remainder = virtual_block_offsets % CP_INTERLEAVE
             local_offsets = rounds * CP_INTERLEAVE + remainder
-            local_positions = virtual_block_indices * kv_block_size + local_offsets
+            sharded_positions = (
+                virtual_block_indices * kv_block_size + local_offsets
+            )
+            # Replicated draft groups store every token locally. Express the
+            # runtime group choice with vector selects so Triton sees the same
+            # types on both paths during kernel compilation.
+            is_replicated = group_cp_size == 1
+            is_local = token_mask & (is_replicated | sharded_is_local)
+            local_positions = tl.where(
+                is_replicated, positions, sharded_positions
+            )
 
         block_indices = local_positions // kernel_block_size
         block_offsets = local_positions % kernel_block_size
@@ -360,8 +372,6 @@ def _compute_slot_mappings_kernel(
             other=0,
         )
         slot_ids = block_numbers * kernel_block_size + block_offsets
-        if CP_SIZE != 1 and group_cp_size != 1:
-            slot_ids = tl.where(is_local, slot_ids, PAD_ID)
-        slot_ids = tl.where(valid_block, slot_ids, PAD_ID)
+        slot_ids = tl.where(is_local & valid_block, slot_ids, PAD_ID)
 
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
