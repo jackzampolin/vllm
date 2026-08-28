@@ -6,8 +6,9 @@ from unittest.mock import patch
 
 import pytest
 
+from vllm.config import CUDAGraphMode
 from vllm.utils.mem_constants import GiB_bytes
-from vllm.v1.worker import startup_plan
+from vllm.v1.worker import gpu_worker, startup_plan
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
@@ -77,3 +78,28 @@ def test_startup_plan_apply_gate(plan_env):
     explicit = _plan_worker(kv_bytes=7 * GiB_bytes)
     maybe_apply_startup_plan(explicit)
     assert explicit.cache_config.kv_cache_memory_bytes == 7 * GiB_bytes
+
+
+@pytest.mark.parametrize(
+    ("enabled", "cuda_alike", "graph_mode", "expected"),
+    [
+        (True, True, CUDAGraphMode.FULL, True),
+        (False, True, CUDAGraphMode.FULL, False),
+        (True, False, CUDAGraphMode.FULL, False),
+        (True, True, CUDAGraphMode.NONE, False),
+    ],
+)
+def test_cudagraph_memory_profile_gate(
+    monkeypatch, enabled, cuda_alike, graph_mode, expected
+):
+    monkeypatch.setattr(
+        gpu_worker.envs, "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", enabled
+    )
+    monkeypatch.setattr(
+        gpu_worker.current_platform, "is_cuda_alike", lambda: cuda_alike
+    )
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(cudagraph_mode=graph_mode)
+    )
+
+    assert gpu_worker._should_profile_cudagraph_memory(config) is expected

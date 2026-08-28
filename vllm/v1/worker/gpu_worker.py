@@ -102,6 +102,14 @@ def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> 
     )
 
 
+def _should_profile_cudagraph_memory(vllm_config: VllmConfig) -> bool:
+    return (
+        envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+        and current_platform.is_cuda_alike()
+        and vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+    )
+
+
 if TYPE_CHECKING:
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -531,10 +539,7 @@ class Worker(WorkerBase):
         # torch.cuda handle the live capture path already uses on ROCm.
         # XPU stays excluded (see #39977).
         cudagraph_memory_estimate = 0
-        if (
-            current_platform.is_cuda_alike()
-            and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-        ):
+        if _should_profile_cudagraph_memory(self.vllm_config):
             cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
         # Respect the opt-in flag as originally designed.
