@@ -2232,6 +2232,32 @@ def test_group_and_unify_kv_cache_specs_mixed_page_size_groups():
     assert layer_names == {"mla.0", "mla.1", "swa.0"}
 
 
+def test_group_dcp_replicated_dflash_draft():
+    target = new_mla_spec()
+    draft = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+        sliding_window=2048,
+        dcp_replicated=True,
+    )
+    assert target.page_size_bytes != draft.page_size_bytes
+
+    specs = {"model.layers.0": target, "draft.layers.0": draft}
+    # DeepSeek-V4's UniformType tuple planner is not needed for DFlash.
+    assert group_and_unify_kv_cache_specs(specs) is None
+
+    groups = get_kv_cache_groups(_grouping_config(), specs)
+    draft_group = next(
+        group
+        for group in groups
+        if isinstance(group.kv_cache_spec, SlidingWindowSpec)
+    )
+    assert all(group.kv_cache_spec.block_size == 16 for group in groups)
+    assert draft_group.kv_cache_spec.dcp_replicated is True
+
+
 def new_indexer_mla_spec(block_size=16):
     # Sparse-attention indexer k_cache: an MLAAttentionSpec with a much smaller
     # page size than the main MLA attention (uint8, small head), so their pages

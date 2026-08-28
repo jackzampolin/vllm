@@ -37,6 +37,21 @@ def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
             layer_impl = getattr(layer, "impl", None)
             if layer_impl is None:
                 continue
+            get_spec = getattr(layer, "get_kv_cache_spec", None)
+            if get_spec is not None:
+                try:
+                    spec = get_spec(vllm_config)
+                except Exception:
+                    spec = None
+                if getattr(spec, "dcp_replicated", False):
+                    # Replicated draft KV contains the complete sequence on
+                    # every rank, so its attention executes as a local DCP1 op.
+                    layer_impl.dcp_world_size = 1
+                    layer_impl.dcp_rank = 0
+                    layer_impl.total_cp_world_size = 1
+                    layer_impl.total_cp_rank = 0
+                    layer_impl.need_to_return_lse_for_decode = False
+                    continue
             speculative_config = vllm_config.speculative_config
             if (
                 speculative_config is not None

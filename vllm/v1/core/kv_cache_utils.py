@@ -670,12 +670,16 @@ def resolve_kv_cache_block_sizes(
     groups = kv_cache_config.kv_cache_groups
 
     if len(groups) <= 1:
-        bs = cache_config.block_size * dcp
+        dcp_replicated = len(groups) == 1 and getattr(
+            groups[0].kv_cache_spec, "dcp_replicated", False
+        )
+        bs = cache_config.block_size * (1 if dcp_replicated else dcp)
         return bs, bs
 
     group_block_sizes = [
         g.kv_cache_spec.block_size * dcp
         if isinstance(g.kv_cache_spec, AttentionSpec)
+        and not getattr(g.kv_cache_spec, "dcp_replicated", False)
         else g.kv_cache_spec.block_size
         for g in groups
     ]
@@ -1595,6 +1599,40 @@ def group_and_unify_kv_cache_specs(
     return [mla_uniform_spec, *swa_uniform_specs]
 
 
+def group_dcp_replicated_draft_kv_cache_specs(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec] | None:
+    """Keep a replicated speculative draft separate from a sharded target.
+
+    DFlash's small sliding-window cache has different allocation and DCP
+    semantics from the target cache. When both sides are independently
+    uniform, retain their concrete specs and native block sizes instead of
+    promoting or page-size-unifying the draft with the target.
+    """
+    replicated = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if getattr(spec, "dcp_replicated", False)
+    }
+    if not replicated:
+        return None
+    sharded = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if not getattr(spec, "dcp_replicated", False)
+    }
+    if not sharded:
+        return None
+    if not is_kv_cache_spec_uniform(sharded) or not is_kv_cache_spec_uniform(
+        replicated
+    ):
+        return None
+    return [
+        *_get_kv_cache_groups_uniform_spec(sharded),
+        *_get_kv_cache_groups_uniform_spec(replicated),
+    ]
+
+
 def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -> int:
     """Pick a chunk size that minimizes total upward padding.
 
@@ -1779,6 +1817,10 @@ def get_kv_cache_groups(
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
+    elif replicated_groups := group_dcp_replicated_draft_kv_cache_specs(
+        kv_cache_spec
+    ):
+        return replicated_groups
     elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
         # DeepseekV4 case: All layers need the same number of token slots,
         # yet some layers are full attention while others are sliding window
