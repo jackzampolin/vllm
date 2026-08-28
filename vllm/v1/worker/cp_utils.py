@@ -37,7 +37,12 @@ def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
             layer_impl = getattr(layer, "impl", None)
             if layer_impl is None:
                 continue
-            if vllm_config.speculative_config is not None and interleave_size > 1:
+            speculative_config = vllm_config.speculative_config
+            if (
+                speculative_config is not None
+                and speculative_config.method == "mtp"
+                and interleave_size > 1
+            ):
                 assert layer_impl.supports_mtp_with_cp_non_trivial_interleave_size, (
                     "MTP with cp_kv_cache_interleave_size > 1 is not "
                     f"supported in {layer_impl.__class__.__name__}."
