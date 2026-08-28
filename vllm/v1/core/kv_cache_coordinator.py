@@ -603,11 +603,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             getattr(group.kv_cache_spec, "dcp_replicated", False)
             for group in kv_cache_config.kv_cache_groups
         )
-        self.has_sliding_eagle_group = any(
-            i in self.eagle_group_ids
-            and isinstance(group.kv_cache_spec, SlidingWindowSpec)
+        self.has_replicated_sliding_group = any(
+            isinstance(group.kv_cache_spec, SlidingWindowSpec)
             and group.kv_cache_spec.dcp_replicated
-            for i, group in enumerate(kv_cache_config.kv_cache_groups)
+            for group in kv_cache_config.kv_cache_groups
         )
         group_block_sizes = [
             manager.block_size for manager in self.single_type_managers
@@ -663,6 +662,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     "cache managers require block-aligned lookups: %s.",
                     ", ".join(sorted(unsupported_partial_hit_managers)),
                 )
+        prefix_cache_alignment_tokens = self._cache_hit_alignment_tokens
+        for manager in self.single_type_managers:
+            manager.prefix_cache_alignment_tokens = prefix_cache_alignment_tokens
         self.verify_and_split_kv_cache_groups()
 
     @property
@@ -777,7 +779,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             retention_interval = self.retention_interval
             if (
                 retention_interval == 0
-                and self.has_sliding_eagle_group
+                and self.has_replicated_sliding_group
                 and isinstance(manager.kv_cache_spec, (MambaSpec, SlidingWindowSpec))
             ):
                 # A DFlash sliding draft drops its own lookahead block, so the

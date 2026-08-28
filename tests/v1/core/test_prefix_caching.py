@@ -3494,8 +3494,8 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary():
 
 def test_dcp_hybrid_dflash_reuses_chunked_prompt_boundary():
     """DCP-sharded target + Mamba + replicated DFlash keeps one common hit."""
-    scheduler_block_size = 2304
-    hash_block_size = scheduler_block_size
+    hash_block_size = 2304
+    scheduler_block_size = hash_block_size * 4
     kv_cache_config = KVCacheConfig(
         num_blocks=2000,
         kv_cache_tensors=[],
@@ -3505,7 +3505,7 @@ def test_dcp_hybrid_dflash_reuses_chunked_prompt_boundary():
                 MLAAttentionSpec(
                     # DCP4 expands this to the 9,216-token effective target
                     # page used by GLM-5.3 Flash at runtime.
-                    block_size=scheduler_block_size,
+                    block_size=hash_block_size,
                     num_kv_heads=1,
                     head_size=1,
                     dtype=torch.float16,
@@ -3544,8 +3544,8 @@ def test_dcp_hybrid_dflash_reuses_chunked_prompt_boundary():
         max_model_len=524288,
         max_in_flight_tokens=4096,
         enable_caching=True,
-        # Explicit per-group EAGLE metadata remains authoritative even when
-        # the aggregate coordinator flag is false.
+        # Replicated DFlash storage requires dense checkpoints independently
+        # of the aggregate coordinator flag.
         use_eagle=False,
         hash_block_size=hash_block_size,
         scheduler_block_size=scheduler_block_size,
@@ -3555,11 +3555,11 @@ def test_dcp_hybrid_dflash_reuses_chunked_prompt_boundary():
     token_ids = list(range(10355))
     fill = make_request("fill", token_ids, hash_block_size, sha256)
     for chunk in (
-        scheduler_block_size,
-        scheduler_block_size,
-        scheduler_block_size,
-        scheduler_block_size,
-        len(token_ids) - 4 * scheduler_block_size,
+        hash_block_size,
+        hash_block_size,
+        hash_block_size,
+        hash_block_size,
+        len(token_ids) - 4 * hash_block_size,
     ):
         blocks = manager.allocate_slots(fill, chunk)
         assert blocks is not None
@@ -3571,12 +3571,12 @@ def test_dcp_hybrid_dflash_reuses_chunked_prompt_boundary():
         replay.block_hashes, replay.num_tokens - 1
     )
     assert per_group_hits == (
-        scheduler_block_size * 3,
-        scheduler_block_size * 4,
-        scheduler_block_size * 3,
+        hash_block_size * 3,
+        hash_block_size * 4,
+        hash_block_size * 3,
     )
     _, num_computed_tokens, _ = manager.get_computed_blocks(replay)
-    assert num_computed_tokens == scheduler_block_size * 3
+    assert num_computed_tokens == hash_block_size * 3
 
 
 def test_block_lookup_cache_single_block_per_key():
