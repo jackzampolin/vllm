@@ -179,10 +179,12 @@ def test_b12x_glm5_next_cache_spec_and_layout(monkeypatch) -> None:
     assert invalid_reasons == []
     assert unidentified == probe
     assert packed_by_glm_backend.state_content_bytes == 528
-    assert packed_by_glm_backend.page_size_padded == 64 * 528 + 16 * 128 * 2
+    assert packed_by_glm_backend.page_size_padded is None
+    assert packed_by_glm_backend.page_size_bytes == 64 * (528 + 33)
     assert packed_by_glm_backend.model_version == "glm5_next"
     assert packed.state_content_bytes == 528
-    assert packed.page_size_padded == 64 * 528 + 16 * 128 * 2
+    assert packed.page_size_padded is None
+    assert packed.page_size_bytes == 64 * (528 + 33)
     assert packed.model_version == "glm5_next"
     assert packed_without_config_context == packed
     assert layouts == (KVCacheLayout.BLHNC,)
@@ -556,6 +558,8 @@ def test_b12x_glm5_next_cache_bind_replans_aligned_manager_page(monkeypatch) -> 
     impl._model_type = 1
     impl._decode_plan = SimpleNamespace()
     impl._extend_plan = SimpleNamespace()
+    impl._ckv_gather_enabled = False
+    impl._ckv_capacity_tokens = 0
     owner = SimpleNamespace(impl=impl, indexer=None)
     cache = torch.empty((2, 1, 2304, 528), dtype=torch.uint8)
 
@@ -577,6 +581,7 @@ def _bare_glm_selector_metadata_builder() -> B12xMLASparseMetadataBuilder:
     builder = B12xMLASparseMetadataBuilder.__new__(B12xMLASparseMetadataBuilder)
     builder.requires_glm_next_selector_metadata = True
     builder.supports_draft_decode_metadata_update = True
+    builder.ckv_prefetch_registry = None
     builder.dcp_world_size = 1
     builder._capture_default_state_slot_ids = torch.arange(4, dtype=torch.int32)
     builder._capture_state_slot_ids = torch.empty(4, dtype=torch.int32)
