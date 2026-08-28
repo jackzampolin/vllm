@@ -14,7 +14,6 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
-    MambaManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -604,9 +603,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             getattr(group.kv_cache_spec, "dcp_replicated", False)
             for group in kv_cache_config.kv_cache_groups
         )
-        self.has_sliding_eagle_group = any(
-            group.is_eagle_group
-            and isinstance(group.kv_cache_spec, SlidingWindowSpec)
+        self.has_sliding_eagle_group = use_eagle and any(
+            isinstance(group.kv_cache_spec, SlidingWindowSpec)
+            and group.kv_cache_spec.dcp_replicated
             for group in kv_cache_config.kv_cache_groups
         )
         group_block_sizes = [
@@ -778,13 +777,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             if (
                 retention_interval == 0
                 and self.has_sliding_eagle_group
-                and isinstance(manager, MambaManager)
+                and isinstance(manager.kv_cache_spec, (MambaSpec, SlidingWindowSpec))
             ):
                 # A DFlash sliding draft drops its own lookahead block, so the
                 # common reusable boundary can be an earlier scheduler-page
                 # boundary rather than the prompt's final hash boundary. Keep
-                # those recurrent states available for group reconciliation.
-                retention_interval = self.scheduler_block_size
+                # the small recurrent/draft caches dense, matching the prefix
+                # behavior before sparse retention became the default.
+                retention_interval = None
             manager.cache_blocks(
                 request,
                 num_tokens_to_cache,

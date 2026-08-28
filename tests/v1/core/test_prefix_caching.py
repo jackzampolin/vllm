@@ -3568,7 +3568,7 @@ def test_dcp_hybrid_dflash_reuses_chunked_prompt_boundary():
     assert per_group_hits == (
         hash_block_size * 40,
         scheduler_block_size * 4,
-        scheduler_block_size * 4,
+        hash_block_size * 39,
     )
     _, num_computed_tokens, _ = manager.get_computed_blocks(replay)
     assert num_computed_tokens == scheduler_block_size * 4

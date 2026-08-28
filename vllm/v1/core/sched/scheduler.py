@@ -325,9 +325,9 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
-        self.mamba_has_sliding_eagle_group = any(
-            group.is_eagle_group
-            and isinstance(group.kv_cache_spec, SlidingWindowSpec)
+        self.mamba_has_sliding_eagle_group = self.use_eagle and any(
+            isinstance(group.kv_cache_spec, SlidingWindowSpec)
+            and group.kv_cache_spec.dcp_replicated
             for group in kv_cache_config.kv_cache_groups
         )
         self.mamba_has_prefill_checkpoint_blocks = (
