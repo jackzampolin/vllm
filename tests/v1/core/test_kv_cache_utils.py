@@ -2079,6 +2079,30 @@ def test_get_kv_cache_configs_attention_free():
     ]
 
 
+def test_get_kv_cache_configs_preserves_model_sliding_window_retention():
+    """Generic spec-decode planning must not erase model-specific retention."""
+    model_config = ModelConfig(max_model_len=4096)
+    vllm_config = VllmConfig(model_config=model_config)
+    vllm_config.cache_config.kv_cache_layout = "LBNHC"
+    vllm_config.cache_config.prefix_cache_retention_interval = None
+    spec = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+        sliding_window=2048,
+        extra_retained_tokens=2048,
+    )
+
+    configs = get_kv_cache_configs(
+        vllm_config,
+        [{"draft": spec}],
+        [spec.page_size_bytes * 1024],
+    )
+
+    assert configs[0].kv_cache_groups[0].kv_cache_spec.extra_retained_tokens == 2048
+
+
 def test_generate_uniform_type_kv_cache_specs():
     # All layers are full attention, can be merged
     kv_cache_specs = {
