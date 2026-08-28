@@ -96,6 +96,11 @@ class MambaHybridModelState(DefaultModelState):
                 (new_req_data.num_computed_tokens - 1) // self.cache_config.block_size
             )
 
+    def reset_kv_cache_state(self) -> None:
+        """Release pointer metadata derived from Mamba cache allocations."""
+        if self._align_mode:
+            self._mamba_ctx = None
+
     def _get_mamba_group_info(
         self, kv_cache_config: KVCacheConfig
     ) -> tuple[list[int], MambaSpec]:

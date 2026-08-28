@@ -29,10 +29,20 @@ from vllm.v1.worker.utils import AttentionGroup
 class Glm5NextAttnMetadata(MambaHybridAttnMetadata):
     """Per-request state consumed by GLM5Next's b12x selector builder."""
 
+    common_is_prefilling: torch.Tensor | None = None
     selector_state_slot_ids: torch.Tensor | None = None
     selector_state_is_fresh: torch.Tensor | None = None
     selector_num_accepted_tokens: torch.Tensor | None = None
     selector_is_prefilling: torch.Tensor | None = None
+
+    def get_extra_common_attn_kwargs(
+        self,
+        kv_cache_group_id: int,
+        num_reqs: int,
+    ) -> dict[str, Any]:
+        del kv_cache_group_id
+        assert self.common_is_prefilling is not None
+        return {"is_prefilling": self.common_is_prefilling[:num_reqs]}
 
     def get_extra_attn_kwargs(
         self,
@@ -235,7 +245,9 @@ class Glm5NextModelState(MambaHybridModelState):
                 )
 
         return Glm5NextAttnMetadata(
-            is_prefilling=self._selector_draft_is_prefilling[:num_reqs_padded],
+            common_is_prefilling=(
+                self._selector_draft_is_prefilling[:num_reqs_padded]
+            ),
             num_accepted_tokens=accepted,
             selector_state_slot_ids=slots,
             selector_state_is_fresh=fresh,
@@ -331,7 +343,7 @@ class Glm5NextModelState(MambaHybridModelState):
                     builder.mamba_aligned_state_indices = all_group_indices[group_idx]
 
         model_metadata = Glm5NextAttnMetadata(
-            is_prefilling=is_prefilling,
+            common_is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
             selector_state_slot_ids=selector_state_slot_ids,
@@ -352,13 +364,16 @@ class Glm5NextModelState(MambaHybridModelState):
             slot_mappings=slot_mappings,
             kv_cache_config=kv_cache_config,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            max_seq_len_upper_bound=input_batch.max_seq_len_upper_bound,
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
+            positions=input_batch.positions,
             model_specific_attn_metadata=model_metadata,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
         )
-        if self.recoverssm is not None:
-            self.recoverssm.record_step(
+        recoverssm = getattr(self, "recoverssm", None)
+        if recoverssm is not None:
+            recoverssm.record_step(
                 attn_metadata,
                 attn_groups,
                 for_capture=for_capture,

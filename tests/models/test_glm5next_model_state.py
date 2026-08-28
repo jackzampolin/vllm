@@ -37,7 +37,7 @@ def _bare_model_state() -> Glm5NextModelState:
 
 def test_glm5next_metadata_targets_only_selector_builder() -> None:
     metadata = Glm5NextAttnMetadata(
-        is_prefilling=torch.zeros(4, dtype=torch.bool),
+        common_is_prefilling=torch.tensor([True, False, False, False]),
         selector_state_slot_ids=torch.tensor([5, 1, -1, -1], dtype=torch.int32),
         selector_state_is_fresh=torch.tensor([False, False, True, True]),
         selector_num_accepted_tokens=torch.tensor([4, 2, 1, 1], dtype=torch.int32),
@@ -57,6 +57,10 @@ def test_glm5next_metadata_targets_only_selector_builder() -> None:
         kwargs["selector_state_slot_ids"], torch.tensor([5, 1], dtype=torch.int32)
     )
     assert metadata.get_extra_attn_kwargs(SimpleNamespace(), 2) == {}
+    assert torch.equal(
+        metadata.get_extra_common_attn_kwargs(0, 2)["is_prefilling"],
+        torch.tensor([True, False]),
+    )
 
 
 def test_glm5next_selector_state_tracks_reordering_and_invalidates_padding() -> None:
@@ -112,6 +116,10 @@ def test_glm5next_draft_metadata_preserves_first_step_acceptance() -> None:
         draft_index=1,
     )
     assert first is not None
+    assert torch.equal(
+        first.common_is_prefilling,
+        torch.zeros(4, dtype=torch.bool),
+    )
     assert torch.equal(
         first.selector_state_slot_ids,
         torch.tensor([5, 1, -1, -1], dtype=torch.int32),
