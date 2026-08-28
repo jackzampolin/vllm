@@ -3544,7 +3544,9 @@ def test_dcp_hybrid_dflash_reuses_chunked_prompt_boundary():
         max_model_len=524288,
         max_in_flight_tokens=4096,
         enable_caching=True,
-        use_eagle=True,
+        # Explicit per-group EAGLE metadata remains authoritative even when
+        # the aggregate coordinator flag is false.
+        use_eagle=False,
         hash_block_size=hash_block_size,
         scheduler_block_size=scheduler_block_size,
         dcp_world_size=4,

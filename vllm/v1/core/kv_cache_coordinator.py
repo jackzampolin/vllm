@@ -603,10 +603,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             getattr(group.kv_cache_spec, "dcp_replicated", False)
             for group in kv_cache_config.kv_cache_groups
         )
-        self.has_sliding_eagle_group = use_eagle and any(
-            isinstance(group.kv_cache_spec, SlidingWindowSpec)
+        self.has_sliding_eagle_group = any(
+            i in self.eagle_group_ids
+            and isinstance(group.kv_cache_spec, SlidingWindowSpec)
             and group.kv_cache_spec.dcp_replicated
-            for group in kv_cache_config.kv_cache_groups
+            for i, group in enumerate(kv_cache_config.kv_cache_groups)
         )
         group_block_sizes = [
             manager.block_size for manager in self.single_type_managers
