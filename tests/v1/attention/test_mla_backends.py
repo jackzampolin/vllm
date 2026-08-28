@@ -1470,6 +1470,102 @@ def test_fp8_dcp_sparse_mla_uses_lse_gather_path(monkeypatch):
     assert impl.seen_q.shape == (1, 4, 5)
 
 
+def test_full_ckv_dcp_prefill_prefers_local_query_over_replicated_query(monkeypatch):
+    from vllm.model_executor.layers.attention import mla_attention
+
+    class FakeDCPGroup:
+        world_size = 2
+        rank_in_group = 0
+
+    class FakeCKVImpl(SparseMLACommonImpl):
+        can_return_lse_for_decode = True
+        supports_quant_query_input = False
+
+        def __init__(self):
+            self.dcp_world_size = 2
+            self.dcp_rank = 0
+            self.pcp_world_size = 1
+            self.pcp_rank = 0
+            self.total_cp_world_size = 2
+            self.total_cp_rank = 0
+            self.need_to_return_lse_for_decode = False
+            self.seen_q = None
+
+        def uses_full_ckv_dcp(self, attn_metadata, num_tokens):
+            return True
+
+        def forward_mqa(self, q, kv_cache, attn_metadata, layer):
+            assert not self.need_to_return_lse_for_decode
+            assert isinstance(q, tuple)
+            self.seen_q = q
+            return torch.ones(
+                (q[0].shape[0], q[0].shape[1], layer.kv_lora_rank),
+                dtype=q[0].dtype,
+            ), None
+
+    monkeypatch.setattr(mla_attention, "get_dcp_group", lambda: FakeDCPGroup())
+
+    layer = object.__new__(MLAAttention)
+    impl = FakeCKVImpl()
+    layer.impl = impl
+    layer.dcp_manager = SimpleNamespace()
+    layer.dcp_a2a = False
+    layer.dcp_b12x = False
+    layer.attn_backend = SimpleNamespace(get_name=lambda: "B12X_MLA_SPARSE")
+    layer.dcp_a2a_max_tokens = 0
+    layer.dcp_a2a_large_backend = "ag_rs"
+    layer.kv_cache_dtype = "fp8_ds_mla"
+    layer.num_heads = 2
+    layer.qk_nope_head_dim = 4
+    layer.qk_rope_head_dim = 2
+    layer.kv_lora_rank = 3
+    layer.v_head_dim = 3
+    layer.q_pad_num_heads = None
+    layer.use_pcp = False
+    layer.force_contiguous_mla_bmm_input = False
+    layer.use_safe_mla_query_bmm = False
+    layer.force_contiguous_mla_bmm_output = False
+    layer.is_aiter_triton_fp4_bmm_enabled = False
+    layer.is_aiter_triton_fp8_bmm_enabled = False
+    layer.W_UK_T = torch.ones((2, 4, 3), dtype=torch.bfloat16)
+    layer._try_fused_mla_query = lambda q_nope, q_pe: None
+
+    def fake_v_up_proj(x, out):
+        out.copy_(x.reshape(out.shape))
+
+    layer._v_up_proj = fake_v_up_proj
+
+    q = torch.ones((1, 2, 6), dtype=torch.bfloat16)
+    q_dcp_replicated = torch.ones((1, 4, 6), dtype=torch.bfloat16)
+    kv_c = torch.empty((1, 3), dtype=torch.bfloat16)
+    k_pe = torch.empty((1, 1, 2), dtype=torch.bfloat16)
+    kv_cache = torch.empty((0,), dtype=torch.uint8)
+    output = torch.empty((1, 6), dtype=torch.bfloat16)
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=1,
+        num_decodes=1,
+        num_prefills=0,
+        num_decode_tokens=1,
+        max_query_len=2,
+    )
+
+    result = MLAAttention.forward_impl(
+        layer,
+        q,
+        kv_c,
+        k_pe,
+        kv_cache,
+        attn_metadata,
+        output,
+        q_dcp_replicated=q_dcp_replicated,
+    )
+
+    assert result is output
+    assert impl.seen_q is not None
+    assert impl.seen_q[0].shape[1] == 2
+    assert impl.seen_q[1].shape[1] == 2
+
+
 def test_fp8_dcp_quantized_query_requires_backend_opt_in(monkeypatch):
     from vllm.model_executor.layers.attention import mla_attention
 

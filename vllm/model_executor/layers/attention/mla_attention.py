@@ -1411,15 +1411,20 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
 
         if num_mqa_tokens > 0:
-            if q_dcp_replicated is not None:
+            full_ckv_dcp = self.impl.uses_full_ckv_dcp(
+                attn_metadata, num_mqa_tokens
+            )
+            # Full-CKV prefill already makes every rank's cache visible to
+            # its local query heads.  Prefer the local projection even when
+            # dcp_q_replicate retained a global query for the ordinary DCP
+            # decode path; feeding that global query to the local-head CKV
+            # plan overflows its query workspace.
+            if q_dcp_replicated is not None and not full_ckv_dcp:
                 mqa_q = q_dcp_replicated[:num_mqa_tokens]
                 qrep_decode = True
             else:
                 mqa_q = q[:num_mqa_tokens]
                 qrep_decode = False
-            full_ckv_dcp = self.impl.uses_full_ckv_dcp(
-                attn_metadata, num_mqa_tokens
-            )
             mqa_output_slice = output[:num_mqa_tokens]
 
             mqa_q_nope, mqa_q_pe = mqa_q.split(
@@ -1528,7 +1533,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 ckv_gather_selector = getattr(
                     self.impl, "dcp_prefill_ckv_gather_eligible", None
                 )
-                ckv_gather_used = bool(
+                ckv_gather_used = full_ckv_dcp or bool(
                     not self.use_pcp
                     and not qrep_decode
                     and callable(ckv_gather_selector)
