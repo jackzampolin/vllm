@@ -512,6 +512,34 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 f"{self._b12x_kda_state_index_columns}"
             )
 
+        scratch_buffers = current_workspace_manager().get_simultaneous(
+            *plan.shapes_and_dtypes()
+        )
+        if not scratch_buffers:
+            raise RuntimeError("b12x KDA plan did not expose caller scratch")
+        scratch: torch.Tensor | tuple[torch.Tensor, ...]
+        scratch = (
+            scratch_buffers[0] if len(scratch_buffers) == 1 else tuple(scratch_buffers)
+        )
+        binding = api.bind_kda(
+            plan,
+            scratch=scratch,
+            mixed_qkv=self._b12x_kda_mixed_qkv,
+            raw_g=self._b12x_kda_raw_g,
+            raw_beta=self._b12x_kda_raw_beta,
+            z=self._b12x_kda_z,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias.view(self.local_num_heads, self.head_dim),
+            norm_weight=self.o_norm.weight,
+            recurrent_state=self.kv_cache[1],
+            query_start_loc=self._b12x_kda_query_start_loc,
+            num_accepted_tokens=self._b12x_kda_num_accepted_tokens,
+            state_indices=self._b12x_kda_state_indices,
+            num_seqs=self._b12x_kda_num_seqs,
+            num_tokens=self._b12x_kda_num_tokens,
+            output=self._b12x_kda_output,
+        )
+
         # Ordinary decode contributes exactly one token and one scheduler-owned
         # state slot per live request. Use the direct B12X specialization when
         # available so this hot path does not stage metadata or copy inputs
@@ -559,33 +587,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             query_start_loc[num_requests : num_requests + 1]
         )
 
-        scratch_buffers = current_workspace_manager().get_simultaneous(
-            *plan.shapes_and_dtypes()
-        )
-        if not scratch_buffers:
-            raise RuntimeError("b12x KDA plan did not expose caller scratch")
-        scratch: torch.Tensor | tuple[torch.Tensor, ...]
-        scratch = (
-            scratch_buffers[0] if len(scratch_buffers) == 1 else tuple(scratch_buffers)
-        )
-        binding = api.bind_kda(
-            plan,
-            scratch=scratch,
-            mixed_qkv=self._b12x_kda_mixed_qkv,
-            raw_g=self._b12x_kda_raw_g,
-            raw_beta=self._b12x_kda_raw_beta,
-            z=self._b12x_kda_z,
-            A_log=self.A_log,
-            dt_bias=self.dt_bias.view(self.local_num_heads, self.head_dim),
-            norm_weight=self.o_norm.weight,
-            recurrent_state=self.kv_cache[1],
-            query_start_loc=self._b12x_kda_query_start_loc,
-            num_accepted_tokens=self._b12x_kda_num_accepted_tokens,
-            state_indices=self._b12x_kda_state_indices,
-            num_seqs=self._b12x_kda_num_seqs,
-            num_tokens=self._b12x_kda_num_tokens,
-            output=self._b12x_kda_output,
-        )
         api.run_kda(
             binding,
             lower_bound=self.gate_lower_bound,
