@@ -40,6 +40,8 @@ from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     _ckv_prefetch_ring_slots,
     _ckv_prefetch_target_indices,
     _ckv_prefetch_workspace_nbytes,
+    _CKVPrefetchStateRegistry,
+    _CKVPrefetchWorkspacePool,
     _global_causal_lens_for_ckv_gather,
     _is_glm_next_ckv_source_layout,
     _selected_index_block_stride_rows,
@@ -381,6 +383,22 @@ def test_b12x_ckv_prefetch_reserves_execution_lanes(
     expected: int,
 ) -> None:
     assert _ckv_prefetch_execution_lanes(num_ubatches, speculative) == expected
+
+
+def test_b12x_ckv_workspace_supports_unresolved_layer_index() -> None:
+    pool = _CKVPrefetchWorkspacePool(torch.device("cpu"), 64, 1)
+    registry = _CKVPrefetchStateRegistry()
+    query_workspace = torch.empty(8, dtype=torch.uint8)
+
+    state = registry.for_workspace(
+        query_workspace,
+        layer_idx=None,
+        kv_cache=None,
+        workspace_pool=pool,
+    )
+
+    assert state.get_ckv_workspace(64).numel() == 64
+    registry.clear()
 
 
 def test_b12x_ckv_prefetch_targets_stop_at_unknown_layer() -> None:

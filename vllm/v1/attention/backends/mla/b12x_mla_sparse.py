@@ -443,8 +443,8 @@ class _CKVPrefetchStateRegistry:
     def for_workspace(
         self,
         workspace: torch.Tensor,
-        layer_idx: int,
-        kv_cache: torch.Tensor,
+        layer_idx: int | None,
+        kv_cache: torch.Tensor | None,
         workspace_pool: _CKVPrefetchWorkspacePool,
     ) -> _CKVPrefetchState:
         self._prune_released_workspaces()
@@ -460,7 +460,9 @@ class _CKVPrefetchStateRegistry:
                     and existing.data_ptr == identity.data_ptr
                 )
                 or (
-                    layer_idx < len(existing_state.layer_caches)
+                    layer_idx is not None
+                    and kv_cache is not None
+                    and layer_idx < len(existing_state.layer_caches)
                     and existing_state.layer_caches[layer_idx] is kv_cache
                 )
             ]
@@ -913,8 +915,11 @@ class B12xMLASparseMetadataBuilder(
             and self.dcp_world_size > 1
             and envs.VLLM_B12X_MLA_CKV_GATHER
         )
+        ckv_workspace_requested = (
+            self.dcp_world_size > 1 and envs.VLLM_B12X_MLA_CKV_GATHER
+        )
         self.ckv_prefetch_registry = (
-            _CKVPrefetchStateRegistry() if self._ckv_gather_requested else None
+            _CKVPrefetchStateRegistry() if ckv_workspace_requested else None
         )
         if self._ckv_gather_requested:
             hf_config = vllm_config.model_config.hf_text_config
@@ -1430,7 +1435,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 self._ckv_local_capacity,
                 _GLM_NEXT_CACHE_RECORD_BYTES,
             )
-            if self._ckv_gather_enabled and self._ckv_prefetch_depth > 0
+            if self._ckv_gather_enabled
             else 0
         )
         execution_lanes = _ckv_prefetch_execution_lanes(
@@ -1769,13 +1774,11 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         use_ckv_gather = self.uses_full_ckv_dcp(attn_metadata, num_tokens)
         layer_idx = self._resolve_layer_index(layer) if use_ckv_gather else None
         prefetch_registry = attn_metadata.ckv_prefetch_registry
-        use_persistent_ckv = (
-            use_ckv_gather
-            and self._ckv_prefetch_depth > 0
-            and self._ckv_workspace_pool is not None
-            and prefetch_registry is not None
-            and layer_idx is not None
-        )
+        if use_ckv_gather and self._ckv_workspace_pool is None:
+            raise RuntimeError("CKV gather requires a persistent workspace pool")
+        if use_ckv_gather and prefetch_registry is None:
+            raise RuntimeError("CKV gather requires a prefetch state registry")
+        use_persistent_ckv = use_ckv_gather
         if use_ckv_gather:
             assert self._ckv_extend_plan is not None
             plan = self._ckv_extend_plan
@@ -1840,7 +1843,6 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         ckv_workspace: torch.Tensor | None = None
         if use_ckv_gather:
             if use_persistent_ckv:
-                assert layer_idx is not None
                 assert prefetch_registry is not None
                 assert self._ckv_workspace_pool is not None
                 prefetch_state = prefetch_registry.for_workspace(
@@ -1849,12 +1851,17 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     kv_c_and_k_pe_cache,
                     self._ckv_workspace_pool,
                 )
-                prefetch_state.enter_layer(layer_idx)
-                prefetch_state.register_cache(layer_idx, kv_c_and_k_pe_cache)
+                if layer_idx is not None:
+                    prefetch_state.enter_layer(layer_idx)
+                    prefetch_state.register_cache(layer_idx, kv_c_and_k_pe_cache)
                 ckv_workspace = prefetch_state.get_ckv_workspace(
                     self._ckv_workspace_nbytes
                 )
-                pending = prefetch_state.pending_layers.pop(layer_idx, None)
+                pending = (
+                    prefetch_state.pending_layers.pop(layer_idx, None)
+                    if layer_idx is not None
+                    else None
+                )
                 if pending is not None:
                     gather_event, current_buf_idx = pending
                     gather_event.wait()
@@ -1873,7 +1880,11 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     )
                 else:
                     prefetch_state.wait_for_pending_writes()
-                    current_buf_idx = layer_idx % self._ckv_workspace_slots
+                    current_buf_idx = (
+                        layer_idx % self._ckv_workspace_slots
+                        if layer_idx is not None
+                        else 0
+                    )
                     local_buffer, gathered_buffer = self._ckv_workspace_views(
                         ckv_workspace, current_buf_idx
                     )
@@ -1892,8 +1903,11 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     gathered_buffer,
                 )
 
-            if prefetch_state is not None and ckv_workspace is not None:
-                assert layer_idx is not None
+            if (
+                prefetch_state is not None
+                and ckv_workspace is not None
+                and layer_idx is not None
+            ):
                 targets = _ckv_prefetch_target_indices(
                     layer_idx,
                     self._ckv_prefetch_depth,
