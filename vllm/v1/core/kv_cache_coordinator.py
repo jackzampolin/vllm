@@ -14,6 +14,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    MambaManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -603,6 +604,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             getattr(group.kv_cache_spec, "dcp_replicated", False)
             for group in kv_cache_config.kv_cache_groups
         )
+        self.has_sliding_eagle_group = any(
+            group.is_eagle_group
+            and isinstance(group.kv_cache_spec, SlidingWindowSpec)
+            for group in kv_cache_config.kv_cache_groups
+        )
         group_block_sizes = [
             manager.block_size for manager in self.single_type_managers
         ]
@@ -768,10 +774,21 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             # (``scheduler_block_size``); retention is passed separately so it
             # can keep both the coarse segment tails and the fine replay
             # boundary (which needs the fine value).
+            retention_interval = self.retention_interval
+            if (
+                retention_interval == 0
+                and self.has_sliding_eagle_group
+                and isinstance(manager, MambaManager)
+            ):
+                # A DFlash sliding draft drops its own lookahead block, so the
+                # common reusable boundary can be an earlier scheduler-page
+                # boundary rather than the prompt's final hash boundary. Keep
+                # those recurrent states available for group reconciliation.
+                retention_interval = self.scheduler_block_size
             manager.cache_blocks(
                 request,
                 num_tokens_to_cache,
-                retention_interval=self.retention_interval,
+                retention_interval=retention_interval,
             )
 
     def find_longest_cache_hit(
@@ -932,6 +949,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 kv_cache_spec=spec,
                 drop_eagle_block=use_eagle,
                 alignment_tokens=self._cache_hit_alignment_tokens,
+                dcp_world_size=(
+                    self.dcp_world_size if isinstance(spec, FullAttentionSpec) else 1
+                ),
             )
             for gid, blks in zip(group_ids, blocks):
                 hit_blocks[gid] = blks
