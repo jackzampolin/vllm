@@ -5,6 +5,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -139,10 +140,25 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         # Initialize cudagraph manager for draft prefill (draft position 0).
+        prefill_cudagraph_mode = cudagraph_mode
+        if envs.VLLM_SPECULATOR_PREFILL_PIECEWISE:
+            if cudagraph_mode.has_piecewise_cudagraphs():
+                prefill_cudagraph_mode = CUDAGraphMode.PIECEWISE
+                logger.info_once(
+                    "Using piecewise-only CUDA graphs for autoregressive "
+                    "draft prefill; decode graph mode remains %s.",
+                    cudagraph_mode.decode_mode().name,
+                )
+            else:
+                logger.warning_once(
+                    "VLLM_SPECULATOR_PREFILL_PIECEWISE=1 was ignored because "
+                    "cudagraph mode %s has no piecewise graphs.",
+                    cudagraph_mode.name,
+                )
         self.prefill_cudagraph_manager = SpeculatorCudaGraphManager(
             self.vllm_config,
             self.device,
-            cudagraph_mode,
+            prefill_cudagraph_mode,
             self.num_speculative_steps + 1,
         )
 
