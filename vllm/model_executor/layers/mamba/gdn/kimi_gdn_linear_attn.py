@@ -537,6 +537,31 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 f"{self._b12x_kda_state_index_columns}"
             )
 
+        # Ordinary decode contributes exactly one token and one scheduler-owned
+        # state slot per live request. Use the direct B12X specialization when
+        # available so this hot path does not stage metadata or copy inputs
+        # through the generic packed-decode buffers. Speculative decode keeps
+        # using run_kda(), which validates its variable-width state transaction.
+        if (
+            num_accepted_tokens is None
+            and num_tokens == num_requests
+            and state_columns == 1
+            and hasattr(api, "run_kda_single_token")
+        ):
+            api.run_kda_single_token(
+                binding,
+                mixed_qkv=mixed_qkv,
+                raw_g=raw_g,
+                raw_beta=raw_beta,
+                z=z,
+                state_indices=state_indices,
+                output=output,
+                lower_bound=self.gate_lower_bound,
+                eps=self.o_norm.eps,
+                scale=self.head_dim**-0.5,
+            )
+            return
+
         self._b12x_kda_mixed_qkv[:num_tokens].copy_(mixed_qkv)
         self._b12x_kda_raw_g[:num_tokens].copy_(raw_g)
         self._b12x_kda_raw_beta[:num_tokens].copy_(raw_beta)
