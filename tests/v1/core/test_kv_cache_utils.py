@@ -2258,6 +2258,38 @@ def test_group_dcp_replicated_dflash_draft():
     assert draft_group.kv_cache_spec.dcp_replicated is True
 
 
+def test_group_dcp_replicated_dflash_with_hybrid_mla_target():
+    target_full = new_mla_spec(block_size=16)
+    target_swa = SlidingWindowMLASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.bfloat16,
+        sliding_window=2048,
+    )
+    draft = SlidingWindowSpec(
+        block_size=256,
+        num_kv_heads=4,
+        head_size=128,
+        dtype=torch.bfloat16,
+        sliding_window=2048,
+        dcp_replicated=True,
+    )
+    config = _grouping_config()
+    groups = get_kv_cache_groups(
+        config,
+        {"target.full": target_full, "target.swa": target_swa, "draft": draft},
+    )
+
+    assert len(groups) == 3
+    assert [group.layer_names for group in groups] == [
+        ["target.full"],
+        ["target.swa"],
+        ["draft"],
+    ]
+    assert groups[-1].kv_cache_spec.dcp_replicated is True
+
+
 def new_indexer_mla_spec(block_size=16):
     # Sparse-attention indexer k_cache: an MLAAttentionSpec with a much smaller
     # page size than the main MLA attention (uint8, small head), so their pages

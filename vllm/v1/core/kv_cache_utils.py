@@ -1600,6 +1600,7 @@ def group_and_unify_kv_cache_specs(
 
 
 def group_dcp_replicated_draft_kv_cache_specs(
+    vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec] | None:
     """Keep a replicated speculative draft separate from a sharded target.
@@ -1623,12 +1624,15 @@ def group_dcp_replicated_draft_kv_cache_specs(
     }
     if not sharded:
         return None
-    if not is_kv_cache_spec_uniform(sharded) or not is_kv_cache_spec_uniform(
-        replicated
-    ):
+    if not is_kv_cache_spec_uniform(replicated):
         return None
+    # The target need not itself be uniform. GLM-5.3, for example, mixes MLA
+    # cache layouts that the normal hybrid grouping path already understands.
+    # Re-enter grouping without the replicated draft so that path can preserve
+    # the target's native groups instead of page-unifying it with the draft.
+    sharded_groups = get_kv_cache_groups(vllm_config, dict(sharded))
     return [
-        *_get_kv_cache_groups_uniform_spec(sharded),
+        *sharded_groups,
         *_get_kv_cache_groups_uniform_spec(replicated),
     ]
 
@@ -1818,7 +1822,7 @@ def get_kv_cache_groups(
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
     elif replicated_groups := group_dcp_replicated_draft_kv_cache_specs(
-        kv_cache_spec
+        vllm_config, kv_cache_spec
     ):
         return replicated_groups
     elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
