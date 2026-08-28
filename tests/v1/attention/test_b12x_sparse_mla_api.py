@@ -595,6 +595,44 @@ def test_b12x_glm5_next_cache_bind_replans_aligned_manager_page(monkeypatch) -> 
     ]
 
 
+def test_b12x_glm5_next_pretouches_largest_attention_workspace(monkeypatch) -> None:
+    calls: list[tuple[tuple[tuple[int, ...], torch.dtype], ...]] = []
+
+    class RecordingWorkspace:
+        def get_simultaneous(self, *specs):
+            calls.append(specs)
+            return [torch.empty(shape, dtype=dtype) for shape, dtype in specs]
+
+    monkeypatch.setattr(
+        b12x_mla_sparse,
+        "current_workspace_manager",
+        lambda: RecordingWorkspace(),
+    )
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._max_tokens = 4
+    impl._input_num_heads = 8
+    impl.num_heads = 2
+    impl._q_head_dim = 16
+    impl._decode_plan = SimpleNamespace(
+        shapes_and_dtypes=lambda: (((64,), torch.uint8),)
+    )
+    impl._extend_plan = SimpleNamespace(
+        shapes_and_dtypes=lambda: (((128,), torch.uint8),)
+    )
+    impl._ckv_extend_plan = SimpleNamespace(
+        shapes_and_dtypes=lambda: (((4096,), torch.uint8),)
+    )
+
+    impl._pretouch_attention_workspace()
+
+    assert calls == [
+        (
+            ((4, 2, 16), torch.bfloat16),
+            ((4096,), torch.uint8),
+        )
+    ]
+
+
 def _bare_glm_selector_metadata_builder() -> B12xMLASparseMetadataBuilder:
     builder = B12xMLASparseMetadataBuilder.__new__(B12xMLASparseMetadataBuilder)
     builder.requires_glm_next_selector_metadata = True
