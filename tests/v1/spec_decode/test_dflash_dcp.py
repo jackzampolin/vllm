@@ -28,4 +28,5 @@ def test_dflash_sliding_window_cache_is_replicated_under_dcp():
 
     assert isinstance(spec, SlidingWindowSpec)
     assert spec.sliding_window == 2048
+    assert spec.extra_retained_tokens == 2048
     assert spec.dcp_replicated is True

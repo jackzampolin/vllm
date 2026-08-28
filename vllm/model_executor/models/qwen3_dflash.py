@@ -192,6 +192,10 @@ class DFlashAttention(Attention):
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
                 sliding_window=self.sliding_window,
+                # Prefix lookup verifies one lookahead block and then drops it.
+                # Keep one additional local window alive during chunked prefill
+                # so the proof block is not recycled before it can be hashed.
+                extra_retained_tokens=self.sliding_window,
                 kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
                 dcp_replicated=dcp_replicated,
             )

@@ -3494,8 +3494,8 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary():
 
 def test_dcp_hybrid_dflash_reuses_chunked_prompt_boundary():
     """DCP-sharded target + Mamba + replicated DFlash keeps one common hit."""
-    hash_block_size = 256
     scheduler_block_size = 2304
+    hash_block_size = scheduler_block_size
     kv_cache_config = KVCacheConfig(
         num_blocks=2000,
         kv_cache_tensors=[],
@@ -3503,14 +3503,15 @@ def test_dcp_hybrid_dflash_reuses_chunked_prompt_boundary():
             KVCacheGroupSpec(
                 ["target"],
                 MLAAttentionSpec(
-                    # DCP4 expands this to the 2,304-token target page used by
-                    # GLM-5.3 Flash at runtime.
-                    block_size=scheduler_block_size // 4,
+                    # DCP4 expands this to the 9,216-token effective target
+                    # page used by GLM-5.3 Flash at runtime.
+                    block_size=scheduler_block_size,
                     num_kv_heads=1,
                     head_size=1,
                     dtype=torch.float16,
                     tokens_per_state=4,
                 ),
+                is_eagle_group=True,
             ),
             KVCacheGroupSpec(
                 ["mamba"],
@@ -3520,6 +3521,7 @@ def test_dcp_hybrid_dflash_reuses_chunked_prompt_boundary():
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
                 ),
+                is_eagle_group=True,
             ),
             KVCacheGroupSpec(
                 ["draft"],
@@ -3530,6 +3532,7 @@ def test_dcp_hybrid_dflash_reuses_chunked_prompt_boundary():
                     dtype=torch.float16,
                     sliding_window=2048,
                     dcp_replicated=True,
+                    extra_retained_tokens=2048,
                 ),
                 is_eagle_group=True,
             ),
@@ -3566,12 +3569,12 @@ def test_dcp_hybrid_dflash_reuses_chunked_prompt_boundary():
         replay.block_hashes, replay.num_tokens - 1
     )
     assert per_group_hits == (
-        hash_block_size * 40,
+        scheduler_block_size * 3,
         scheduler_block_size * 4,
-        hash_block_size * 39,
+        scheduler_block_size * 3,
     )
     _, num_computed_tokens, _ = manager.get_computed_blocks(replay)
-    assert num_computed_tokens == scheduler_block_size * 4
+    assert num_computed_tokens == scheduler_block_size * 3
 
 
 def test_block_lookup_cache_single_block_per_key():
