@@ -129,7 +129,7 @@ def test_autoregressive_speculator_uses_sparse_full_draft_prefill_graphs(
             CUDAGraphMode.FULL_AND_PIECEWISE,
             {"full_capture_request_sizes": frozenset({1, 2, 4, 8, 16, 32})},
         ),
-        (CUDAGraphMode.FULL_DECODE_ONLY, {}),
+        (CUDAGraphMode.FULL_DECODE_ONLY, {"decode_query_len": 1}),
     ]
 
 
