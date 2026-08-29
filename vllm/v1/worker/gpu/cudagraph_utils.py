@@ -114,6 +114,7 @@ class CudaGraphManager:
         decode_query_len: int,
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
+        full_capture_request_sizes: frozenset[int] | None = None,
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -123,6 +124,7 @@ class CudaGraphManager:
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
         self.varlen_decode = varlen_decode
+        self.full_capture_request_sizes = full_capture_request_sizes
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -248,6 +250,11 @@ class CudaGraphManager:
                         rounded_num_tokens > max_decode_tokens
                         or rounded_num_tokens > max_cg_capture_size
                         or rounded_num_reqs > self.max_num_reqs
+                    ):
+                        continue
+                    if (
+                        self.full_capture_request_sizes is not None
+                        and rounded_num_reqs not in self.full_capture_request_sizes
                     ):
                         continue
 
@@ -676,6 +683,7 @@ def prepare_inputs_to_capture(
 # CUDA graph memory profiling
 # ---------------------------------------------------------------------------
 
+
 def _profiling_cudagraph_managers(runner: "GPUModelRunner") -> list[CudaGraphManager]:
     managers: list[CudaGraphManager] = []
     if isinstance(runner.cudagraph_manager, CudaGraphManager):
@@ -812,6 +820,8 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
             )
         _teardown_profiling_state(runner)
     return graph_memory
+
+
 def _init_minimal_kv_cache_for_profiling(runner: "GPUModelRunner") -> None:
     """Allocate the smallest KV cache that still lets every graph be captured."""
     from vllm.v1.core.kv_cache_utils import (

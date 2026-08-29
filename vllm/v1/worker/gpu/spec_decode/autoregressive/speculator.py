@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 from typing import Any
 
 import torch
@@ -25,6 +24,17 @@ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.utils import AttentionGroup, get_uniform_decode_token_count
 
 logger = init_logger(__name__)
+
+
+def _sparse_full_capture_request_sizes(max_num_reqs: int) -> frozenset[int]:
+    """Return power-of-two request capacities, including the configured maximum."""
+    request_sizes = []
+    request_size = 1
+    while request_size < max_num_reqs:
+        request_sizes.append(request_size)
+        request_size *= 2
+    request_sizes.append(max_num_reqs)
+    return frozenset(request_sizes)
 
 
 class AutoRegressiveSpeculator(DraftModelSpeculator):
@@ -140,26 +150,15 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         # Initialize cudagraph manager for draft prefill (draft position 0).
-        prefill_cudagraph_mode = cudagraph_mode
-        if os.environ.get("VLLM_SPECULATOR_PREFILL_PIECEWISE", "0") == "1":
-            if cudagraph_mode.has_piecewise_cudagraphs():
-                prefill_cudagraph_mode = CUDAGraphMode.PIECEWISE
-                logger.info_once(
-                    "Using piecewise-only CUDA graphs for autoregressive "
-                    "draft prefill; decode graph mode remains %s.",
-                    cudagraph_mode.decode_mode().name,
-                )
-            else:
-                logger.warning_once(
-                    "VLLM_SPECULATOR_PREFILL_PIECEWISE=1 was ignored because "
-                    "cudagraph mode %s has no piecewise graphs.",
-                    cudagraph_mode.name,
-                )
+        full_capture_request_sizes = _sparse_full_capture_request_sizes(
+            self.max_num_reqs
+        )
         self.prefill_cudagraph_manager = SpeculatorCudaGraphManager(
             self.vllm_config,
             self.device,
-            prefill_cudagraph_mode,
+            cudagraph_mode,
             self.num_speculative_steps + 1,
+            full_capture_request_sizes=full_capture_request_sizes,
         )
 
         # PIECEWISE cudagraphs are not supported for draft decodes.
