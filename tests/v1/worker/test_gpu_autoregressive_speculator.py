@@ -20,7 +20,10 @@ from vllm.model_executor.models.mistral_large_3_eagle import (
 )
 from vllm.v1.attention.backends import flash_attn as flash_attn_module
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
-from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.cudagraph_utils import (
+    BatchExecutionDescriptor,
+    CudaGraphManager,
+)
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.spec_decode import speculator as base_spec_module
 from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as spec_module
@@ -102,41 +105,60 @@ class _QSAIntervalLifecycle:
         self.calls.append("compact_topk")
 
 
-@pytest.mark.parametrize(
-    ("piecewise_prefill", "expected_prefill_mode"),
-    [
-        (False, CUDAGraphMode.FULL_AND_PIECEWISE),
-        (True, CUDAGraphMode.PIECEWISE),
-    ],
-)
-def test_autoregressive_speculator_can_limit_draft_prefill_to_piecewise_graphs(
+def test_autoregressive_speculator_uses_sparse_full_draft_prefill_graphs(
     monkeypatch,
-    piecewise_prefill: bool,
-    expected_prefill_mode: CUDAGraphMode,
 ) -> None:
-    manager_modes: list[CUDAGraphMode] = []
+    manager_args: list[tuple[CUDAGraphMode, dict[str, Any]]] = []
 
     def make_manager(_config, _device, mode, *args, **kwargs):
-        manager_modes.append(mode)
+        manager_args.append((mode, kwargs))
         return SimpleNamespace()
 
-    monkeypatch.setenv(
-        "VLLM_SPECULATOR_PREFILL_PIECEWISE",
-        "1" if piecewise_prefill else "0",
-    )
     monkeypatch.setattr(spec_module, "SpeculatorCudaGraphManager", make_manager)
 
     speculator = object.__new__(_TestSpeculator)
     speculator.vllm_config = SimpleNamespace()
     speculator.device = torch.device("cpu")
     speculator.num_speculative_steps = 5
+    speculator.max_num_reqs = 32
 
     speculator.init_cudagraph_manager(CUDAGraphMode.FULL_AND_PIECEWISE)
 
-    assert manager_modes == [
-        expected_prefill_mode,
-        CUDAGraphMode.FULL_DECODE_ONLY,
+    assert manager_args == [
+        (
+            CUDAGraphMode.FULL_AND_PIECEWISE,
+            {"full_capture_request_sizes": frozenset({1, 2, 4, 8, 16, 32})},
+        ),
+        (CUDAGraphMode.FULL_DECODE_ONLY, {}),
     ]
+
+
+def test_cudagraph_manager_excludes_uncaptured_full_candidates() -> None:
+    manager = object.__new__(CudaGraphManager)
+    manager.compilation_config = SimpleNamespace(
+        cudagraph_capture_sizes=[1, 2, 4, *range(8, 193, 8)],
+        max_cudagraph_capture_size=192,
+    )
+    manager.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+    manager.max_num_reqs = 32
+    manager.decode_query_len = 6
+    manager.varlen_decode = False
+    manager.vllm_config = SimpleNamespace(speculative_config=None)
+    manager.lora_capture_cases = [0]
+    manager.full_capture_request_sizes = frozenset({1, 2, 4, 8, 16, 32})
+    manager._capture_descs = {}
+    manager._candidates = {}
+
+    manager._init_candidates()
+
+    full_descs = manager._capture_descs[CUDAGraphMode.FULL]
+    assert {desc.num_tokens for desc in full_descs} == {6, 12, 24, 48, 96, 192}
+    assert all(
+        desc.cg_mode != CUDAGraphMode.FULL
+        or desc.num_tokens in {6, 12, 24, 48, 96, 192}
+        for candidates in manager._candidates.values()
+        for desc in candidates
+    )
 
 
 def _mock_base_model_load(monkeypatch):
